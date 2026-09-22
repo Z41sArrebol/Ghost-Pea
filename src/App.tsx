@@ -1,52 +1,68 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Alert,
+  App as AntApp,
   Button,
-  Card,
   Checkbox,
   ConfigProvider,
+  Divider,
+  Input,
   Progress,
+  Segmented,
   Select,
-  Slider,
   Space,
+  Tabs,
   Tag,
   theme,
   Typography,
 } from "antd";
-import { useAudioFeatures } from "./audio/useAudioFeatures";
 import { useAiMood } from "./ai/useAiMood";
-import { FilterRenderer } from "./gl/FilterRenderer";
+import { useAudioFeatures } from "./audio/useAudioFeatures";
+import { ParamSliders } from "./components/ParamSliders";
+import { FilterRenderer, type FitMode, type UniformValues } from "./gl/FilterRenderer";
+import { THEME_PRESETS } from "./params/presets";
+import { DEFAULT_PARAMS, type ParamValues } from "./params/schema";
 
 const STATUS_UPDATE_MS = 250;
 
-// 每个特征通道独立的 Attack/Release 时间常数（秒）。
-// 瞬态类快攻快放，趋势类慢速跟随，画面才不抽搐。
-const CHANNEL_TAU = {
-  rms: { attack: 0.05, release: 0.35 },
-  bass: { attack: 0.08, release: 0.4 },
-  treble: { attack: 0.05, release: 0.3 },
-  onset: { attack: 0.01, release: 0.15 },
-  centroid: { attack: 0.2, release: 0.8 },
-} as const;
+type FunctionKey = "filter" | "mapping" | "orchestrator" | "camera" | "ai" | "presets";
 
-type SmoothedFeatures = Record<keyof typeof CHANNEL_TAU, number>;
+const TAB_ITEMS: { key: FunctionKey; label: string }[] = [
+  { key: "filter", label: "滤镜" },
+  { key: "mapping", label: "映射" },
+  { key: "orchestrator", label: "编排" },
+  { key: "camera", label: "相机" },
+  { key: "ai", label: "AI" },
+  { key: "presets", label: "预设" },
+];
 
-function smoothToward(current: number, target: number, dt: number, tau: { attack: number; release: number }): number {
-  const t = target > current ? tau.attack : tau.release;
-  return current + (target - current) * (1 - Math.exp(-dt / t));
+interface CameraConfig {
+  deviceId: string;
+  resolution: "auto" | "720p" | "1080p";
+  frameRate: number;
 }
 
-function DemoPage() {
+type SmoothedFeatures = Record<"rms" | "bass" | "treble" | "onset" | "centroid", number>;
+
+function smoothToward(current: number, target: number, dt: number, attack: number, release: number): number {
+  const tau = target > current ? attack : release;
+  return current + (target - current) * (1 - Math.exp(-dt / tau));
+}
+
+function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; onToggleTheme: () => void }) {
+  const { message, modal } = AntApp.useApp();
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
   const [cameras, setCameras] = useState<MediaDeviceInfo[]>([]);
-  const [deviceId, setDeviceId] = useState("");
+  const [cameraConfig, setCameraConfig] = useState<CameraConfig>({ deviceId: "", resolution: "auto", frameRate: 0 });
   const [cameraError, setCameraError] = useState("");
   const [glError, setGlError] = useState("");
   const [bypass, setBypass] = useState(false);
-  const [intensity, setIntensity] = useState(0.8);
+  const [fitMode, setFitMode] = useState<FitMode>("cover");
+  const [params, setParams] = useState<ParamValues>({ ...DEFAULT_PARAMS });
+  const [activeFn, setActiveFn] = useState<FunctionKey>("filter");
   const [fps, setFps] = useState(0);
   const [meter, setMeter] = useState<SmoothedFeatures>({ rms: 0, bass: 0, treble: 0, onset: 0, centroid: 0 });
 
@@ -55,15 +71,26 @@ function DemoPage() {
 
   const bypassRef = useRef(bypass);
   bypassRef.current = bypass;
-  const intensityRef = useRef(intensity);
-  intensityRef.current = intensity;
+  const fitModeRef = useRef(fitMode);
+  fitModeRef.current = fitMode;
+  const paramsRef = useRef(params);
+  paramsRef.current = params;
 
-  const startCamera = useCallback(async (id: string) => {
+  const setParam = useCallback((key: string, value: number) => {
+    setParams((prev) => ({ ...prev, [key]: value }));
+  }, []);
+
+  const startCamera = useCallback(async (config: CameraConfig) => {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     try {
       const constraints: MediaStreamConstraints = {
-        video: id ? { deviceId: { exact: id } } : true,
+        video: {
+          ...(config.deviceId ? { deviceId: { exact: config.deviceId } } : {}),
+          ...(config.resolution === "720p" ? { width: { ideal: 1280 }, height: { ideal: 720 } } : {}),
+          ...(config.resolution === "1080p" ? { width: { ideal: 1920 }, height: { ideal: 1080 } } : {}),
+          ...(config.frameRate > 0 ? { frameRate: { ideal: config.frameRate } } : {}),
+        },
         audio: false,
       };
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
@@ -82,6 +109,10 @@ function DemoPage() {
   }, []);
 
   useEffect(() => {
+    void startCamera(cameraConfig);
+  }, [cameraConfig, startCamera]);
+
+  useEffect(() => {
     let renderer: FilterRenderer | null = null;
     try {
       if (!canvasRef.current) throw new Error("canvas 未挂载");
@@ -89,8 +120,6 @@ function DemoPage() {
     } catch (error) {
       setGlError(error instanceof Error ? error.message : String(error));
     }
-
-    void startCamera("");
 
     let raf = 0;
     let last = performance.now();
@@ -103,21 +132,39 @@ function DemoPage() {
       last = now;
       if (dt > 0) fpsEma = fpsEma * 0.9 + (1 / dt) * 0.1;
 
+      const p = paramsRef.current;
       const features = featuresRef.current;
-      // 静音时动态通道目标归零，平滑回落到主题基础值
-      const silent = features.silence;
-      smoothed.rms = smoothToward(smoothed.rms, silent ? 0 : features.rms, dt, CHANNEL_TAU.rms);
-      smoothed.bass = smoothToward(smoothed.bass, silent ? 0 : features.bass, dt, CHANNEL_TAU.bass);
-      smoothed.treble = smoothToward(smoothed.treble, silent ? 0 : features.treble, dt, CHANNEL_TAU.treble);
-      smoothed.onset = smoothToward(smoothed.onset, silent ? 0 : features.onset, dt, CHANNEL_TAU.onset);
-      smoothed.centroid = smoothToward(smoothed.centroid, features.centroid, dt, CHANNEL_TAU.centroid);
+      // 静音回落开启时，静音帧把动态通道目标归零，平滑回到基础值
+      const silent = features.silence && p.silenceFallback > 0.5;
+      smoothed.rms = smoothToward(smoothed.rms, silent ? 0 : features.rms, dt, p.rmsAttack, p.rmsRelease);
+      smoothed.bass = smoothToward(smoothed.bass, silent ? 0 : features.bass, dt, p.bassAttack, p.bassRelease);
+      smoothed.treble = smoothToward(smoothed.treble, silent ? 0 : features.treble, dt, p.trebleAttack, p.trebleRelease);
+      smoothed.onset = smoothToward(smoothed.onset, silent ? 0 : features.onset, dt, p.onsetAttack, p.onsetRelease);
+      smoothed.centroid = smoothToward(smoothed.centroid, features.centroid, dt, p.centroidAttack, p.centroidRelease);
 
       if (renderer && videoRef.current) {
-        renderer.render(videoRef.current, now / 1000, {
-          ...smoothed,
-          intensity: intensityRef.current,
-          bypass: bypassRef.current,
-        });
+        const uniforms: UniformValues = {
+          uTime: now / 1000,
+          uRms: smoothed.rms,
+          uBass: smoothed.bass,
+          uTreble: smoothed.treble,
+          uOnset: smoothed.onset,
+          uCentroid: smoothed.centroid,
+          uIntensity: p.intensity,
+          uBypass: bypassRef.current ? 1 : 0,
+          uBaseContrast: p.baseContrast,
+          uBrightness: p.brightness,
+          uVignette: p.vignette,
+          uGrainBase: p.grainBase,
+          uHighlightThr: p.highlightThr,
+          uShadowCool: p.shadowCool,
+          uMapRmsGlow: p.mapRmsGlow,
+          uMapBassWarm: p.mapBassWarm,
+          uMapTrebleGrain: p.mapTrebleGrain,
+          uMapOnsetContrast: p.mapOnsetContrast,
+          uMapCentroidTemp: p.mapCentroidTemp,
+        };
+        renderer.render(videoRef.current, uniforms, fitModeRef.current);
       }
 
       if (now - lastStatus > STATUS_UPDATE_MS) {
@@ -134,113 +181,254 @@ function DemoPage() {
       streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
     };
-  }, [startCamera, featuresRef]);
+  }, [featuresRef]);
+
+  const exportParams = useCallback(async () => {
+    const json = JSON.stringify(params, null, 2);
+    try {
+      await navigator.clipboard.writeText(json);
+      message.success("参数 JSON 已复制到剪贴板");
+    } catch {
+      modal.info({
+        title: "当前参数 JSON（手动复制）",
+        content: <Input.TextArea rows={10} readOnly value={json} />,
+        width: 480,
+      });
+    }
+  }, [params, message, modal]);
+
+  const importParams = useCallback(() => {
+    let text = "";
+    modal.confirm({
+      title: "导入参数 JSON",
+      content: (
+        <Input.TextArea
+          rows={8}
+          placeholder='{"baseContrast": 1.12, ...}'
+          onChange={(e) => {
+            text = e.target.value;
+          }}
+        />
+      ),
+      width: 480,
+      onOk: () => {
+        try {
+          const parsed: unknown = JSON.parse(text);
+          if (typeof parsed !== "object" || parsed === null) throw new Error("not an object");
+          const merged = { ...paramsRef.current };
+          for (const key of Object.keys(DEFAULT_PARAMS)) {
+            const value = Number((parsed as Record<string, unknown>)[key]);
+            if (Number.isFinite(value)) merged[key] = value;
+          }
+          setParams(merged);
+          message.success("参数已导入");
+        } catch {
+          message.error("JSON 解析失败，未做任何修改");
+        }
+      },
+    });
+  }, [message, modal]);
+
+  const panelContent = () => {
+    switch (activeFn) {
+      case "filter":
+      case "mapping":
+      case "orchestrator":
+        return <ParamSliders group={activeFn} params={params} onChange={setParam} />;
+      case "camera":
+        return (
+          <Space orientation="vertical" size="middle" style={{ width: "100%" }}>
+            <div>
+              <Typography.Text>分辨率</Typography.Text>
+              <Select
+                style={{ width: "100%", marginTop: 8 }}
+                value={cameraConfig.resolution}
+                onChange={(resolution) => setCameraConfig((c) => ({ ...c, resolution }))}
+                options={[
+                  { value: "auto", label: "自动" },
+                  { value: "720p", label: "1280 × 720" },
+                  { value: "1080p", label: "1920 × 1080" },
+                ]}
+              />
+            </div>
+            <div>
+              <Typography.Text>帧率</Typography.Text>
+              <Select
+                style={{ width: "100%", marginTop: 8 }}
+                value={cameraConfig.frameRate}
+                onChange={(frameRate) => setCameraConfig((c) => ({ ...c, frameRate }))}
+                options={[
+                  { value: 0, label: "自动" },
+                  { value: 30, label: "30 FPS" },
+                  { value: 60, label: "60 FPS" },
+                ]}
+              />
+            </div>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              修改后相机会重启视频流。
+            </Typography.Text>
+          </Space>
+        );
+      case "ai":
+        return (
+          <Space orientation="vertical" size="middle">
+            <Typography.Text>
+              状态：
+              {!workerReady && "Worker 启动中"}
+              {workerReady && !mood && "等待 PCM 输入"}
+              {workerReady && mood && (moodState === "neutral" ? "Neutral（置信度不足）" : moodState)}
+              {stale && "（超时保持）"}
+            </Typography.Text>
+            {mood && (
+              <Typography.Text type="secondary">
+                happy {mood.happy.toFixed(2)} · sad {mood.sad.toFixed(2)} · relaxed {mood.relaxed.toFixed(2)} · aggressive{" "}
+                {mood.aggressive.toFixed(2)} · 推理 {mood.inferenceMs.toFixed(1)}ms
+              </Typography.Text>
+            )}
+            <Button onClick={selfTest}>发送自测 PCM</Button>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              模型未接入，当前为占位推理；后端 16 kHz PCM 通道就绪后经 sendPcm 喂入真实音频。
+            </Typography.Text>
+          </Space>
+        );
+      case "presets":
+        return (
+          <Space orientation="vertical" size="middle" style={{ width: "100%" }}>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              预设只覆盖滤镜与映射参数，编排器和相机配置不受影响。
+            </Typography.Text>
+            {THEME_PRESETS.map((preset) => (
+              <Button
+                key={preset.key}
+                block
+                onClick={() => {
+                  setParams((prev) => {
+                    const next = { ...prev };
+                    for (const [key, value] of Object.entries(preset.values)) {
+                      if (value !== undefined) next[key] = value;
+                    }
+                    return next;
+                  });
+                  message.success(`已应用预设：${preset.label}`);
+                }}
+              >
+                {preset.label}
+              </Button>
+            ))}
+            <Divider style={{ margin: "8px 0" }} />
+            <Button block onClick={() => setParams({ ...DEFAULT_PARAMS })}>
+              重置为默认参数
+            </Button>
+            <Button block onClick={() => void exportParams()}>
+              导出参数 JSON
+            </Button>
+            <Button block onClick={importParams}>
+              导入参数 JSON
+            </Button>
+          </Space>
+        );
+    }
+  };
 
   return (
     <div className="page">
-      <Space align="baseline">
-        <Typography.Title level={4} style={{ margin: 0 }}>
-          Ghost Pea · 共振镜头
-        </Typography.Title>
-        <Tag>前端链路验证 spike</Tag>
-      </Space>
+      <div className="stage">
+        <video ref={videoRef} className="hidden-video" playsInline muted />
+        <canvas ref={canvasRef} className={`preview${fitMode === "cover" ? " fit-cover" : ""}`} />
+        <Select
+          className="device-select"
+          size="small"
+          value={cameraConfig.deviceId}
+          onChange={(deviceId) => setCameraConfig((c) => ({ ...c, deviceId }))}
+          options={[
+            { value: "", label: "默认相机" },
+            ...cameras.map((cam, i) => ({ value: cam.deviceId, label: cam.label || `相机 ${i + 1}` })),
+          ]}
+        />
 
-      <Card styles={{ body: { padding: 0, background: "#000", position: "relative" } }}>
-        <video ref={videoRef} style={{ display: "none" }} playsInline muted />
-        <canvas ref={canvasRef} className="preview" />
+        <div className="stage-actions">
+          <Segmented
+            size="small"
+            value={fitMode}
+            onChange={(value) => setFitMode(value as FitMode)}
+            options={[
+              { label: "铺满", value: "cover" },
+              { label: "适应", value: "contain" },
+            ]}
+          />
+          <Button size="small" type="primary" onClick={() => void (running ? stop() : start())}>
+            {running ? "停止音频" : "开始音频"}
+          </Button>
+          {running && (
+            <Tag color={source === "tauri" ? "green" : "orange"}>{source === "tauri" ? "系统音频" : "模拟信号"}</Tag>
+          )}
+          <Checkbox checked={bypass} onChange={(e) => setBypass(e.target.checked)}>
+            A/B 原图
+          </Checkbox>
+        </div>
+
+        <div className="stage-stats">
+          <Typography.Text type="secondary">FPS {fps}</Typography.Text>
+          <Space size={4}>
+            <Typography.Text type="secondary">RMS</Typography.Text>
+            <Progress percent={Math.min(100, meter.rms * 100)} size={{ width: 80, height: 6 }} showInfo={false} />
+            <Typography.Text type="secondary">{meter.rms.toFixed(3)}</Typography.Text>
+          </Space>
+          <Typography.Text type="secondary">
+            B {(meter.bass * 100).toFixed(0)}% M {((1 - meter.bass - meter.treble) * 100).toFixed(0)}% T {(meter.treble * 100).toFixed(0)}%
+          </Typography.Text>
+          {status && (
+            <Typography.Text type="secondary">
+              {status.sampleRateHz}Hz {status.channels}ch 丢样{status.droppedSamples}
+            </Typography.Text>
+          )}
+          <Tag color={stale ? "orange" : "default"}>
+            AI {moodState === "neutral" ? "Neutral" : moodState}
+            {stale && "·超时"}
+          </Tag>
+        </div>
+
         {(cameraError || glError) && (
           <Alert
             type="error"
             showIcon
-            style={{ position: "absolute", left: 12, right: 12, bottom: 12 }}
+            className="stage-alert"
             title={[glError, cameraError].filter(Boolean).join("；")}
           />
         )}
-      </Card>
+      </div>
 
-      <Card size="small">
-        <Space wrap size="middle">
-          <Space>
-            <Typography.Text type="secondary">相机</Typography.Text>
-            <Select
-              style={{ width: 220 }}
-              value={deviceId}
-              onChange={(value) => { setDeviceId(value); void startCamera(value); }}
-              options={[
-                { value: "", label: "默认相机" },
-                ...cameras.map((cam, i) => ({ value: cam.deviceId, label: cam.label || `相机 ${i + 1}` })),
-              ]}
-            />
-          </Space>
-
-          <Button type="primary" onClick={() => void (running ? stop() : start())}>
-            {running ? "停止音频监听" : "开始音频监听"}
-          </Button>
-          {running && (
-            <Tag color={source === "tauri" ? "green" : "orange"}>
-              {source === "tauri" ? "系统音频（Rust 后端）" : "模拟信号（浏览器无后端）"}
-            </Tag>
-          )}
-
-          <Checkbox checked={bypass} onChange={(e) => setBypass(e.target.checked)}>
-            A/B：显示原图
-          </Checkbox>
-
-          <Button size="small" onClick={selfTest}>
-            AI 自测
-          </Button>
-
-          <Space>
-            <Typography.Text type="secondary">动态强度</Typography.Text>
-            <Slider
-              style={{ width: 160 }}
-              min={0}
-              max={100}
-              value={Math.round(intensity * 100)}
-              onChange={(value) => setIntensity(value / 100)}
-              tooltip={{ formatter: (value) => `${value}%` }}
-            />
-            <Typography.Text type="secondary">{Math.round(intensity * 100)}%</Typography.Text>
-          </Space>
-        </Space>
-      </Card>
-
-      <Space size="large" wrap>
-        <Typography.Text type="secondary">FPS：{fps}</Typography.Text>
-        <Space size={8}>
-          <Typography.Text type="secondary">RMS</Typography.Text>
-          <Progress
-            percent={Math.min(100, meter.rms * 100)}
-            size={{ width: 120, height: 6 }}
-            showInfo={false}
+      <div className="side">
+        <div className="topbar">
+          <Tabs
+            className="top-tabs"
+            size="small"
+            activeKey={activeFn}
+            onChange={(key) => setActiveFn(key as FunctionKey)}
+            items={TAB_ITEMS}
           />
-          <Typography.Text type="secondary">{meter.rms.toFixed(3)}</Typography.Text>
-        </Space>
-        <Typography.Text type="secondary">
-          B {(meter.bass * 100).toFixed(0)}% · M {((1 - meter.bass - meter.treble) * 100).toFixed(0)}% · T {(meter.treble * 100).toFixed(0)}%
-        </Typography.Text>
-        {status && (
-          <Typography.Text type="secondary">
-            {status.sampleRateHz} Hz / {status.channels} ch · 丢样 {status.droppedSamples}
-          </Typography.Text>
-        )}
-        <Tag color={stale ? "orange" : "default"}>
-          AI：
-          {!workerReady && "Worker 启动中"}
-          {workerReady && !mood && "等待输入"}
-          {workerReady && mood && (moodState === "neutral" ? "Neutral（置信度不足）" : moodState)}
-          {workerReady && mood && ` · ${mood.inferenceMs.toFixed(1)}ms`}
-          {stale && " · 超时保持"}
-        </Tag>
-      </Space>
+          <Button size="small" className="theme-toggle" onClick={onToggleTheme}>
+            {themeMode === "dark" ? "白天" : "黑夜"}
+          </Button>
+        </div>
+        <div className="panel">{panelContent()}</div>
+      </div>
     </div>
   );
 }
 
 function App() {
+  const [themeMode, setThemeMode] = useState<"dark" | "light">("dark");
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = themeMode;
+  }, [themeMode]);
+
   return (
-    <ConfigProvider theme={{ algorithm: theme.darkAlgorithm }}>
-      <DemoPage />
+    <ConfigProvider theme={{ algorithm: themeMode === "dark" ? theme.darkAlgorithm : theme.defaultAlgorithm }}>
+      <AntApp>
+        <DemoPage themeMode={themeMode} onToggleTheme={() => setThemeMode((m) => (m === "dark" ? "light" : "dark"))} />
+      </AntApp>
     </ConfigProvider>
   );
 }
