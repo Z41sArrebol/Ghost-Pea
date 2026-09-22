@@ -66,7 +66,15 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
   const [meter, setMeter] = useState<SmoothedFeatures>({ rms: 0, bass: 0, treble: 0, onset: 0, centroid: 0 });
 
   const { featuresRef, running, source, status, start, stop } = useAudioFeatures();
-  const { mood, moodState, workerReady, stale, selfTest } = useAiMood();
+  const {
+    mood,
+    moodState,
+    workerReady,
+    stale,
+    status: aiStatus,
+    error: aiError,
+    selfTest,
+  } = useAiMood();
 
   const bypassRef = useRef(bypass);
   bypassRef.current = bypass;
@@ -271,23 +279,52 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
         );
       case "ai":
         return (
-          <Space direction="vertical" size="medium">
-            <Typography.Text>
-              状态：
-              {!workerReady && "Worker 启动中"}
-              {workerReady && !mood && "等待 PCM 输入"}
-              {workerReady && mood && (moodState === "neutral" ? "Neutral（置信度不足）" : moodState)}
-              {stale && "（超时保持）"}
-            </Typography.Text>
-            {mood && (
-              <Typography.Text type="secondary">
-                happy {mood.happy.toFixed(2)} · sad {mood.sad.toFixed(2)} · relaxed {mood.relaxed.toFixed(2)} · aggressive{" "}
-                {mood.aggressive.toFixed(2)} · 推理 {mood.inferenceMs.toFixed(1)}ms
-              </Typography.Text>
-            )}
-            <Button onClick={selfTest}>发送自测 PCM</Button>
+          <Space direction="vertical" size="medium" style={{ width: "100%" }}>
+            <Space wrap>
+              <Tag color={workerReady ? "green" : aiStatus.phase === "failed" ? "red" : "orange"}>
+                {aiStatus.phase}
+              </Tag>
+              <Tag color={aiStatus.backendConnected ? "green" : "default"}>
+                PCM {aiStatus.backendConnected ? "已连接" : "未连接"}
+              </Tag>
+              <Tag color={aiStatus.modelReady ? "green" : "orange"}>
+                模型 {aiStatus.modelReady ? "就绪" : "占位"}
+              </Tag>
+              {stale && <Tag color="orange">结果超时</Tag>}
+            </Space>
+
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "minmax(88px, auto) minmax(0, 1fr)",
+                gap: "8px 16px",
+                fontVariantNumeric: "tabular-nums",
+              }}
+            >
+              <Typography.Text type="secondary">情绪状态</Typography.Text>
+              <Typography.Text>{moodState === "neutral" ? "Neutral" : moodState}</Typography.Text>
+              <Typography.Text type="secondary">Stream epoch</Typography.Text>
+              <Typography.Text>{mood?.streamEpoch.toString() ?? "-"}</Typography.Text>
+              <Typography.Text type="secondary">Sequence</Typography.Text>
+              <Typography.Text>{mood?.sequence.toString() ?? "-"}</Typography.Text>
+              <Typography.Text type="secondary">Confidence</Typography.Text>
+              <Typography.Text>{mood ? mood.confidence.toFixed(4) : "-"}</Typography.Text>
+              <Typography.Text type="secondary">Inference</Typography.Text>
+              <Typography.Text>{mood ? `${mood.inferenceMs.toFixed(1)} ms` : "-"}</Typography.Text>
+              <Typography.Text type="secondary">Happy</Typography.Text>
+              <Typography.Text>{mood ? mood.happy.toFixed(4) : "-"}</Typography.Text>
+              <Typography.Text type="secondary">Sad</Typography.Text>
+              <Typography.Text>{mood ? mood.sad.toFixed(4) : "-"}</Typography.Text>
+              <Typography.Text type="secondary">Relaxed</Typography.Text>
+              <Typography.Text>{mood ? mood.relaxed.toFixed(4) : "-"}</Typography.Text>
+              <Typography.Text type="secondary">Aggressive</Typography.Text>
+              <Typography.Text>{mood ? mood.aggressive.toFixed(4) : "-"}</Typography.Text>
+            </div>
+
+            {aiError && <Alert type="error" content={aiError} />}
+            <Button onClick={selfTest}>重新连接 AI</Button>
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-              模型未接入，当前为占位推理；后端 16 kHz PCM 通道就绪后经 sendPcm 喂入真实音频。
+              当前模型输出为占位值；启动音频后，每个 3 秒 PCM 窗口会在此刷新。
             </Typography.Text>
           </Space>
         );
