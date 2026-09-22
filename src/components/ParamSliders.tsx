@@ -9,7 +9,7 @@ interface ParamSlidersProps {
 
 // schema 驱动的参数列表：PARAM_DEFS 里加一条定义，这里自动多一行
 export function ParamSliders({ group, params, onChange }: ParamSlidersProps) {
-  const defs = PARAM_DEFS.filter((def) => def.group === group);
+  const defs = PARAM_DEFS.filter((def) => def.group === group && !(def.kind === "slider" && def.hidden));
   return (
     <div>
       {defs.map((def) => (

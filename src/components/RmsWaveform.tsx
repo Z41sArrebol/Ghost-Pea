@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { rmsToVisualLevel } from "../params/orchestrator";
 
 const COLS = 46;
 const ROWS = 8;
@@ -52,7 +53,7 @@ export function RmsWaveform({ levelRef }: RmsWaveformProps) {
       const offset = COLS - history.length;
       for (let col = 0; col < COLS; col++) {
         const value = col < offset ? 0 : history[col - offset];
-        const filled = Math.round(Math.min(1, value) * ROWS);
+        const filled = Math.round(rmsToVisualLevel(value) * ROWS);
         for (let row = 0; row < ROWS; row++) {
           const x = col * (CELL + GAP);
           const y = HEIGHT - (row + 1) * CELL - row * GAP;

@@ -1,7 +1,5 @@
 import type { ParamValues } from "./schema";
 
-// P1 三主题的参数包雏形。预设只覆盖 filter + mapping 两组，
-// 编排器（平滑手感）和相机配置不受主题切换影响。
 export interface ThemePreset {
   key: string;
   label: string;
@@ -13,6 +11,9 @@ export const THEME_PRESETS: ThemePreset[] = [
     key: "dark",
     label: "Dark / Tension",
     values: {
+      lookDark: 1,
+      lookCalm: 0,
+      lookBright: 0,
       baseContrast: 1.12,
       brightness: 0.95,
       vignette: 1,
@@ -30,6 +31,9 @@ export const THEME_PRESETS: ThemePreset[] = [
     key: "calm",
     label: "Calm / Dream",
     values: {
+      lookDark: 0,
+      lookCalm: 1,
+      lookBright: 0,
       baseContrast: 1.0,
       brightness: 1.0,
       vignette: 0.5,
@@ -47,6 +51,9 @@ export const THEME_PRESETS: ThemePreset[] = [
     key: "bright",
     label: "Bright / Alive",
     values: {
+      lookDark: 0,
+      lookCalm: 0,
+      lookBright: 1,
       baseContrast: 1.05,
       brightness: 1.1,
       vignette: 0.3,

@@ -129,6 +129,16 @@ body {
   z-index: 5;
 }
 
+@media (max-width: 1000px) {
+  .stage-actions {
+    top: 52px;
+    left: 12px;
+    right: auto;
+    max-width: calc(100% - 24px);
+    flex-wrap: wrap;
+  }
+}
+
 .stage-stats {
   position: absolute;
   left: 12px;
@@ -156,6 +166,15 @@ body {
 .rms-wave {
   display: block;
   border-radius: 3px;
+}
+
+.mode-control {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
 }
 
 .panel {
