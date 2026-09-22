@@ -129,6 +129,16 @@ body {
   z-index: 5;
 }
 
+@media (max-width: 1000px) {
+  .stage-actions {
+    top: 52px;
+    left: 12px;
+    right: auto;
+    max-width: calc(100% - 24px);
+    flex-wrap: wrap;
+  }
+}
+
 .stage-stats {
   position: absolute;
   left: 12px;
