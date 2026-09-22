@@ -6,9 +6,8 @@ use audio::{
     AiPcmStatus, AudioFeatures, AudioMonitor, AudioStatus, DspPerformance, FeatureSink,
     PerformanceSink, WindowSink,
 };
-#[cfg(debug_assertions)]
 use tauri::Manager;
-use tauri::{ipc::Channel, ipc::InvokeResponseBody, AppHandle, Emitter, State};
+use tauri::{ipc::Channel, ipc::InvokeResponseBody, AppHandle, Emitter};
 
 const AUDIO_FEATURES_EVENT: &str = "audio-features";
 const AUDIO_PERFORMANCE_EVENT: &str = "audio-performance";
@@ -30,49 +29,65 @@ fn performance_sink(app: AppHandle) -> PerformanceSink {
 }
 
 #[tauri::command]
-fn start_audio_monitor(
+async fn start_audio_monitor(app: AppHandle) -> Result<AudioStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let monitor = app.state::<AudioMonitor>();
+        monitor.start(feature_sink(app.clone()), performance_sink(app.clone()))
+    })
+    .await
+    .map_err(|error| format!("audio start task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn stop_audio_monitor(app: AppHandle) -> Result<AudioStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<AudioMonitor>().stop())
+        .await
+        .map_err(|error| format!("audio stop task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn audio_monitor_status(app: AppHandle) -> Result<AudioStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<AudioMonitor>().status())
+        .await
+        .map_err(|error| format!("audio status task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn audio_performance_status(app: AppHandle) -> Result<DspPerformance, String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<AudioMonitor>().performance_status())
+        .await
+        .map_err(|error| format!("audio performance task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn start_ai_pcm_stream(
     app: AppHandle,
-    monitor: State<'_, AudioMonitor>,
-) -> Result<AudioStatus, String> {
-    monitor.start(feature_sink(app.clone()), performance_sink(app))
-}
-
-#[tauri::command]
-fn stop_audio_monitor(monitor: State<'_, AudioMonitor>) -> Result<AudioStatus, String> {
-    monitor.stop()
-}
-
-#[tauri::command]
-fn audio_monitor_status(monitor: State<'_, AudioMonitor>) -> Result<AudioStatus, String> {
-    monitor.status()
-}
-
-#[tauri::command]
-fn audio_performance_status(monitor: State<'_, AudioMonitor>) -> Result<DspPerformance, String> {
-    monitor.performance_status()
-}
-
-#[tauri::command]
-fn start_ai_pcm_stream(
-    monitor: State<'_, AudioMonitor>,
     channel: Channel<InvokeResponseBody>,
 ) -> Result<AiPcmStatus, String> {
-    let sink: WindowSink = Arc::new(move |payload| {
-        channel
-            .send(InvokeResponseBody::Raw(payload))
-            .map_err(|error| error.to_string())
-    });
-    monitor.start_ai_pcm(sink)
+    tauri::async_runtime::spawn_blocking(move || {
+        let sink: WindowSink = Arc::new(move |payload| {
+            channel
+                .send(InvokeResponseBody::Raw(payload))
+                .map_err(|error| error.to_string())
+        });
+        app.state::<AudioMonitor>().start_ai_pcm(sink)
+    })
+    .await
+    .map_err(|error| format!("AI PCM start task failed: {error}"))?
 }
 
 #[tauri::command]
-fn stop_ai_pcm_stream(monitor: State<'_, AudioMonitor>) -> Result<AiPcmStatus, String> {
-    monitor.stop_ai_pcm()
+async fn stop_ai_pcm_stream(app: AppHandle) -> Result<AiPcmStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<AudioMonitor>().stop_ai_pcm())
+        .await
+        .map_err(|error| format!("AI PCM stop task failed: {error}"))?
 }
 
 #[tauri::command]
-fn ai_pcm_status(monitor: State<'_, AudioMonitor>) -> Result<AiPcmStatus, String> {
-    monitor.ai_pcm_status()
+async fn ai_pcm_status(app: AppHandle) -> Result<AiPcmStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<AudioMonitor>().ai_pcm_status())
+        .await
+        .map_err(|error| format!("AI PCM status task failed: {error}"))?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

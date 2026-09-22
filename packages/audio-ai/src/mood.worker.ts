@@ -1,4 +1,5 @@
 import type { MoodResult } from "./contracts";
+import { MoodRuntime } from "./moodRuntime";
 import type { MainToWorkerMessage, WorkerToMainMessage } from "./workerProtocol";
 
 const workerScope = self as unknown as {
@@ -9,43 +10,39 @@ const workerScope = self as unknown as {
 
 let initialized = false;
 let modelReady = false;
+const runtime = new MoodRuntime();
 
-function inferPlaceholder(message: Extract<MainToWorkerMessage, { type: "pcm" }>): MoodResult {
+async function infer(message: Extract<MainToWorkerMessage, { type: "pcm" }>): Promise<MoodResult> {
   const startedAt = performance.now();
   const pcm = new Float32Array(message.payload);
-  let squareSum = 0;
-  for (const sample of pcm) squareSum += sample * sample;
-  void squareSum;
+  const scores = await runtime.predict(pcm);
 
   return {
     streamEpoch: message.streamEpoch,
     sequence: message.sequence,
-    scores: {
-      happy: 0.25,
-      sad: 0.25,
-      relaxed: 0.25,
-      aggressive: 0.25,
-    },
-    confidence: 0,
+    scores,
+    confidence: Math.max(scores.happy, scores.sad, scores.relaxed, scores.aggressive),
     inferenceMs: performance.now() - startedAt,
     modelReady,
   };
 }
 
-workerScope.onmessage = (event) => {
+workerScope.onmessage = async (event) => {
   const message = event.data;
   try {
     switch (message.type) {
       case "init":
-        void message.modelBaseUrl;
+        await runtime.initialize(message.modelBaseUrl);
         initialized = true;
+        modelReady = true;
         workerScope.postMessage({ type: "ready", modelReady });
         break;
       case "pcm":
         if (!initialized) throw new Error("AI worker is not initialized");
-        workerScope.postMessage({ type: "result", result: inferPlaceholder(message) });
+        workerScope.postMessage({ type: "result", result: await infer(message) });
         break;
       case "dispose":
+        runtime.dispose();
         workerScope.postMessage({ type: "disposed" });
         workerScope.close();
         break;

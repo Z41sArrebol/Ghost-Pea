@@ -206,6 +206,7 @@ struct RunningAudio {
 
 #[derive(Default)]
 pub struct AudioMonitor {
+    lifecycle: Mutex<()>,
     running: Mutex<Option<RunningAudio>>,
 }
 
@@ -215,6 +216,10 @@ impl AudioMonitor {
         feature_sink: FeatureSink,
         performance_sink: PerformanceSink,
     ) -> Result<AudioStatus, String> {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_| "audio lifecycle state poisoned")?;
         let mut running = self.running.lock().map_err(|_| "audio state poisoned")?;
         if let Some(active) = running.as_ref() {
             match active.runtime.state() {
@@ -362,6 +367,10 @@ impl AudioMonitor {
     }
 
     pub fn stop(&self) -> Result<AudioStatus, String> {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_| "audio lifecycle state poisoned")?;
         let active = self
             .running
             .lock()
@@ -538,15 +547,21 @@ fn run_capture_inner(
         }
         consecutive_event_timeouts = 0;
 
-        while capture_client
-            .get_next_packet_size()
-            .map_err(|error| format!("failed to query capture packet: {error}"))?
-            .is_some()
-        {
+        loop {
+            let packet_frames = capture_client
+                .get_next_packet_size()
+                .map_err(|error| format!("failed to query capture packet: {error}"))?;
+            if !should_read_capture_packet(stop.load(Ordering::Acquire), packet_frames) {
+                break;
+            }
+
             let (frames, _) = capture_client
                 .read_from_device(&mut bytes)
                 .map_err(|error| format!("failed to read loopback packet: {error}"))?;
             let frames = frames as usize;
+            if frames == 0 {
+                break;
+            }
             downmix_f32(&bytes, &mut mono[..frames], channels as usize);
             let written = producer.push_slice(&mono[..frames]);
             if written < frames {
@@ -563,6 +578,10 @@ fn run_capture_inner(
     audio_client
         .stop_stream()
         .map_err(|error| format!("failed to stop loopback capture: {error}"))
+}
+
+fn should_read_capture_packet(stopping: bool, packet_frames: Option<u32>) -> bool {
+    !stopping && packet_frames.is_some_and(|frames| frames > 0)
 }
 
 fn run_dsp(
@@ -839,6 +858,14 @@ mod tests {
         let mut features = Vec::new();
         analyzer.process(samples, |snapshot, _| features.push(snapshot));
         features
+    }
+
+    #[test]
+    fn capture_packet_loop_stops_for_shutdown_and_empty_packets() {
+        assert!(!should_read_capture_packet(true, Some(128)));
+        assert!(!should_read_capture_packet(false, Some(0)));
+        assert!(!should_read_capture_packet(false, None));
+        assert!(should_read_capture_packet(false, Some(128)));
     }
 
     #[test]
