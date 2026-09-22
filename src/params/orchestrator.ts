@@ -22,7 +22,7 @@ const BASE_TAU = 0.2;
 const RMS_SILENCE_THRESHOLD = 0.001;
 const FEATURE_KEYS = ["rms", "bass", "treble", "onset", "centroid"] as const;
 const LOOK_KEYS = ["lookDark", "lookCalm", "lookBright"] as const;
-const OUTPUT_LIMITS: Record<keyof RenderParameters, [number, number, number?]> = {
+export const OUTPUT_LIMITS: Record<keyof RenderParameters, [number, number, number?]> = {
   contrast: [0.5, 2, 0.8],
   brightness: [0.5, 1.5, 0.4],
   temperature: [-1, 1, 0.8],

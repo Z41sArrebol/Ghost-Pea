@@ -16,9 +16,11 @@ export type AiMood = MoodResult["scores"] &
     rawHappy: number;
     rawSad: number;
     valence: number;
+    silent: boolean;
+    receivedAt: number;
   };
 type RawAiMood = MoodResult["scores"] &
-  Pick<MoodResult, "streamEpoch" | "sequence" | "inferenceMs" | "modelReady">;
+  Pick<MoodResult, "streamEpoch" | "sequence" | "inferenceMs" | "modelReady"> & { receivedAt: number };
 
 const HAPPY_VALENCE_THRESHOLD = 0.65;
 const SAD_VALENCE_THRESHOLD = 0.35;
@@ -38,8 +40,15 @@ function getDominanceConfidence(mood: MoodResult["scores"]): number {
   return highest > 0 ? (highest - secondHighest) / highest : 0;
 }
 
+export function getActiveAiMood(mood: AiMood | null, status: AudioMoodStatus, now: number): AiMood | null {
+  if (!mood || !mood.modelReady || mood.silent || !status.modelReady || !status.backendConnected) return null;
+  if (status.phase !== "running" && status.phase !== "degraded") return null;
+  const age = now - mood.receivedAt;
+  return age >= 0 && age <= AI_STALE_MS ? mood : null;
+}
+
 export function resolveDominantMood(mood: AiMood | null): DominantMood | null {
-  if (!mood || !mood.modelReady) return null;
+  if (!mood || !mood.modelReady || mood.silent) return null;
   const candidates = [
     ["happy", mood.happy],
     ["sad", mood.sad],
@@ -50,7 +59,7 @@ export function resolveDominantMood(mood: AiMood | null): DominantMood | null {
 }
 
 export function resolveMoodLabel(mood: AiMood | null): MoodLabel {
-  if (!mood || !mood.modelReady) return "neutral";
+  if (!mood || !mood.modelReady || mood.silent) return "neutral";
   if (mood.aggressive >= AGGRESSIVE_THRESHOLD) return "aggressive";
   if (mood.valence >= HAPPY_VALENCE_THRESHOLD) return "happy";
   if (mood.valence <= SAD_VALENCE_THRESHOLD) return "sad";
@@ -98,6 +107,11 @@ export function useAiMood(valenceSensitivity = 24): AiMoodHandle {
     serviceRef.current = service;
 
     const unsubscribeResult = service.subscribe((result) => {
+      const { happy, sad, relaxed, aggressive } = result.scores;
+      if (![happy, sad, relaxed, aggressive].every((score) => Number.isFinite(score) && score >= 0 && score <= 1)) {
+        setRawMood(null);
+        return;
+      }
       lastMoodAtRef.current = performance.now();
       setStale(false);
       setRawMood({
@@ -106,9 +120,17 @@ export function useAiMood(valenceSensitivity = 24): AiMoodHandle {
         sequence: result.sequence,
         inferenceMs: result.inferenceMs,
         modelReady: result.modelReady,
+        receivedAt: lastMoodAtRef.current,
       });
     });
-    const unsubscribeStatus = service.subscribeStatus(setStatus);
+    const unsubscribeStatus = service.subscribeStatus((next) => {
+      setStatus(next);
+      if (!next.modelReady || !next.backendConnected || (next.phase !== "running" && next.phase !== "degraded")) {
+        setRawMood(null);
+        lastMoodAtRef.current = 0;
+        setStale(false);
+      }
+    });
     let syncing = false;
     const syncWithAudioMonitor = async () => {
       if (syncing || !isTauri()) return;
@@ -141,7 +163,10 @@ export function useAiMood(valenceSensitivity = 24): AiMoodHandle {
 
   const mood: AiMood | null = rawMood
     ? (() => {
-        const calibrated = calibrateHappySad(rawMood.happy, rawMood.sad, valenceSensitivity);
+        const silent = [rawMood.happy, rawMood.sad, rawMood.relaxed, rawMood.aggressive].every((score) => score === 0);
+        const calibrated = silent
+          ? { happy: 0, sad: 0, valence: 0.5 }
+          : calibrateHappySad(rawMood.happy, rawMood.sad, valenceSensitivity);
         const scores = {
           happy: calibrated.happy,
           sad: calibrated.sad,
@@ -154,6 +179,7 @@ export function useAiMood(valenceSensitivity = 24): AiMoodHandle {
           rawHappy: rawMood.happy,
           rawSad: rawMood.sad,
           valence: calibrated.valence,
+          silent,
           confidence: getDominanceConfidence(scores),
         };
       })()
@@ -170,15 +196,19 @@ export function useAiMood(valenceSensitivity = 24): AiMoodHandle {
   const selfTest = useCallback(() => {
     const service = serviceRef.current;
     if (!service) return;
+    setRawMood(null);
+    lastMoodAtRef.current = 0;
+    setStale(false);
     void service.stop().then(() => service.start()).catch(() => undefined);
   }, []);
 
   const workerReady = status.phase === "running" || status.phase === "degraded";
+  const activeMood = getActiveAiMood(mood, status, performance.now());
   return {
     mood,
-    moodLabel: resolveMoodLabel(mood),
-    moodState: resolveMoodState(mood),
-    dominantMood: resolveDominantMood(mood),
+    moodLabel: resolveMoodLabel(activeMood),
+    moodState: resolveMoodState(activeMood),
+    dominantMood: resolveDominantMood(activeMood),
     workerReady,
     stale,
     status,

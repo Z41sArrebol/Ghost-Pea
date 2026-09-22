@@ -16,12 +16,13 @@ import {
   Typography,
 } from "@arco-design/web-react";
 import { IconMoon, IconSun } from "@arco-design/web-react/icon";
-import { useAiMood } from "./ai/useAiMood";
+import { AiFilterController, type FilterMode } from "./ai/AiFilterController";
+import { getActiveAiMood, useAiMood } from "./ai/useAiMood";
 import { AUDIO_STALE_MS, useAudioFeatures } from "./audio/useAudioFeatures";
 import { ParamSliders } from "./components/ParamSliders";
 import { RmsWaveform } from "./components/RmsWaveform";
 import { FilterRenderer, type FitMode, type UniformValues } from "./gl/FilterRenderer";
-import { ParameterOrchestrator } from "./params/orchestrator";
+import { ParameterOrchestrator, rmsToVisualLevel } from "./params/orchestrator";
 import { THEME_PRESETS } from "./params/presets";
 import { DEFAULT_PARAMS, parseParams, type ParamValues } from "./params/schema";
 import { useCamera, type CameraConfig } from "./useCamera";
@@ -49,6 +50,7 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
   const [previewAttempt, setPreviewAttempt] = useState(0);
   const [bypass, setBypass] = useState(false);
   const [fitMode, setFitMode] = useState<FitMode>("cover");
+  const [filterMode, setFilterMode] = useState<FilterMode>("default");
   const [params, setParams] = useState<ParamValues>({ ...DEFAULT_PARAMS });
   const [activeFn, setActiveFn] = useState<FunctionKey>("filter");
   const [frameStats, setFrameStats] = useState({ render: 0, video: 0, p95: 0 });
@@ -74,7 +76,12 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
   fitModeRef.current = fitMode;
   const paramsRef = useRef(params);
   paramsRef.current = params;
+  const aiControlRef = useRef({ filterMode, mood, status: aiStatus, running });
+  aiControlRef.current = { filterMode, mood, status: aiStatus, running };
   const rmsLevelRef = useRef(0);
+  const aiDriving = running && !audioStale && !featuresRef.current.silence
+    && rmsToVisualLevel(featuresRef.current.rms) > 0
+    && getActiveAiMood(mood, aiStatus, performance.now()) !== null;
 
   const setParam = useCallback((key: string, value: number) => {
     setParams((prev) => ({ ...prev, [key]: value }));
@@ -101,6 +108,7 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
     canvas.addEventListener("webglcontextlost", onLost);
     canvas.addEventListener("webglcontextrestored", onRestored);
     const orchestrator = new ParameterOrchestrator(paramsRef.current);
+    const aiController = new AiFilterController();
     let raf = 0;
     let last = performance.now();
     let lastStatus = last;
@@ -115,7 +123,12 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
       last = now;
       const receivedAt = lastReceivedAtRef.current;
       const available = receivedAt !== null && now - receivedAt <= AUDIO_STALE_MS;
-      const p = orchestrator.update(paramsRef.current, featuresRef.current, available, dt);
+      const base = orchestrator.update(paramsRef.current, featuresRef.current, available, dt);
+      const control = aiControlRef.current;
+      const audible = control.running && available && !featuresRef.current.silence
+        && rmsToVisualLevel(featuresRef.current.rms) > 0;
+      const activeMood = audible ? getActiveAiMood(control.mood, control.status, now) : null;
+      const p = aiController.update(base, orchestrator.params, control.filterMode, activeMood, dt);
       rmsLevelRef.current = orchestrator.features.rms;
       if (renderer && videoRef.current) {
         const uniforms: UniformValues = {
@@ -332,7 +345,9 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
             {aiError && <Alert type="error" content={aiError} />}
             <Button onClick={selfTest}>重新连接 AI</Button>
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-              {aiStatus.modelReady ? "模型已就绪" : "模型尚未就绪"}；此处只展示分析结果，不直接控制滤镜。
+              {filterMode === "ai"
+                ? "多种情绪共同影响调色、柔光和颗粒，缓慢过渡，不按单个标签切换预设。"
+                : "当前为默认模式，AI 仅展示分析结果；切换 AI 模式后参与滤镜控制。"}
             </Typography.Text>
           </Space>
         );
@@ -472,6 +487,31 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
             icon={themeMode === "dark" ? <IconSun /> : <IconMoon />}
             onClick={onToggleTheme}
           />
+        </div>
+        <div className="mode-control">
+          <Radio.Group
+            type="button"
+            size="small"
+            aria-label="滤镜控制模式"
+            value={filterMode}
+            onChange={setFilterMode}
+            options={[
+              { label: "默认模式", value: "default" },
+              { label: "AI 模式", value: "ai" },
+            ]}
+          />
+          <Typography.Text type="secondary" style={{ fontSize: 12 }} role="status">
+            {filterMode === "default"
+              ? "声音特征驱动，保留现有滤镜与映射。"
+              : aiDriving
+                ? "AI 混合氛围 · 缓慢变化"
+                : "AI 暂无有效音乐情绪，平缓回到基础滤镜。"}
+          </Typography.Text>
+          {filterMode === "ai" && (
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              全局动态强度控制情绪影响；静音或分析中断时仍保持 AI 模式。
+            </Typography.Text>
+          )}
         </div>
         <div className="panel">{panelContent()}</div>
       </div>
