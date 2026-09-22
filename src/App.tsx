@@ -1,24 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Alert,
-  App as AntApp,
   Button,
   Checkbox,
-  ConfigProvider,
   Divider,
   Input,
-  Progress,
-  Segmented,
+  Message,
+  Modal,
+  Radio,
   Select,
   Space,
   Tabs,
   Tag,
-  theme,
   Typography,
-} from "antd";
+} from "@arco-design/web-react";
+import { IconMoon, IconSun } from "@arco-design/web-react/icon";
 import { useAiMood } from "./ai/useAiMood";
 import { useAudioFeatures } from "./audio/useAudioFeatures";
 import { ParamSliders } from "./components/ParamSliders";
+import { RmsWaveform } from "./components/RmsWaveform";
 import { FilterRenderer, type FitMode, type UniformValues } from "./gl/FilterRenderer";
 import { THEME_PRESETS } from "./params/presets";
 import { DEFAULT_PARAMS, type ParamValues } from "./params/schema";
@@ -50,7 +50,6 @@ function smoothToward(current: number, target: number, dt: number, attack: numbe
 }
 
 function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; onToggleTheme: () => void }) {
-  const { message, modal } = AntApp.useApp();
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -75,6 +74,7 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
   fitModeRef.current = fitMode;
   const paramsRef = useRef(params);
   paramsRef.current = params;
+  const rmsLevelRef = useRef(0);
 
   const setParam = useCallback((key: string, value: number) => {
     setParams((prev) => ({ ...prev, [key]: value }));
@@ -141,6 +141,7 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
       smoothed.treble = smoothToward(smoothed.treble, silent ? 0 : features.treble, dt, p.trebleAttack, p.trebleRelease);
       smoothed.onset = smoothToward(smoothed.onset, silent ? 0 : features.onset, dt, p.onsetAttack, p.onsetRelease);
       smoothed.centroid = smoothToward(smoothed.centroid, features.centroid, dt, p.centroidAttack, p.centroidRelease);
+      rmsLevelRef.current = smoothed.rms;
 
       if (renderer && videoRef.current) {
         const uniforms: UniformValues = {
@@ -178,6 +179,7 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
 
     return () => {
       cancelAnimationFrame(raf);
+      renderer?.dispose();
       streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
     };
@@ -187,30 +189,28 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
     const json = JSON.stringify(params, null, 2);
     try {
       await navigator.clipboard.writeText(json);
-      message.success("参数 JSON 已复制到剪贴板");
+      Message.success("参数 JSON 已复制到剪贴板");
     } catch {
-      modal.info({
+      Modal.info({
         title: "当前参数 JSON（手动复制）",
         content: <Input.TextArea rows={10} readOnly value={json} />,
-        width: 480,
       });
     }
-  }, [params, message, modal]);
+  }, [params]);
 
   const importParams = useCallback(() => {
     let text = "";
-    modal.confirm({
+    Modal.confirm({
       title: "导入参数 JSON",
       content: (
         <Input.TextArea
           rows={8}
           placeholder='{"baseContrast": 1.12, ...}'
-          onChange={(e) => {
-            text = e.target.value;
+          onChange={(value) => {
+            text = value;
           }}
         />
       ),
-      width: 480,
       onOk: () => {
         try {
           const parsed: unknown = JSON.parse(text);
@@ -221,13 +221,13 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
             if (Number.isFinite(value)) merged[key] = value;
           }
           setParams(merged);
-          message.success("参数已导入");
+          Message.success("参数已导入");
         } catch {
-          message.error("JSON 解析失败，未做任何修改");
+          Message.error("JSON 解析失败，未做任何修改");
         }
       },
     });
-  }, [message, modal]);
+  }, []);
 
   const panelContent = () => {
     switch (activeFn) {
@@ -237,7 +237,7 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
         return <ParamSliders group={activeFn} params={params} onChange={setParam} />;
       case "camera":
         return (
-          <Space orientation="vertical" size="middle" style={{ width: "100%" }}>
+          <Space direction="vertical" size="medium" style={{ width: "100%" }}>
             <div>
               <Typography.Text>分辨率</Typography.Text>
               <Select
@@ -271,7 +271,7 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
         );
       case "ai":
         return (
-          <Space orientation="vertical" size="middle">
+          <Space direction="vertical" size="medium">
             <Typography.Text>
               状态：
               {!workerReady && "Worker 启动中"}
@@ -293,14 +293,14 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
         );
       case "presets":
         return (
-          <Space orientation="vertical" size="middle" style={{ width: "100%" }}>
+          <Space direction="vertical" size="medium" style={{ width: "100%" }}>
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>
               预设只覆盖滤镜与映射参数，编排器和相机配置不受影响。
             </Typography.Text>
             {THEME_PRESETS.map((preset) => (
               <Button
                 key={preset.key}
-                block
+                long
                 onClick={() => {
                   setParams((prev) => {
                     const next = { ...prev };
@@ -309,20 +309,20 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
                     }
                     return next;
                   });
-                  message.success(`已应用预设：${preset.label}`);
+                  Message.success(`已应用预设：${preset.label}`);
                 }}
               >
                 {preset.label}
               </Button>
             ))}
             <Divider style={{ margin: "8px 0" }} />
-            <Button block onClick={() => setParams({ ...DEFAULT_PARAMS })}>
+            <Button long onClick={() => setParams({ ...DEFAULT_PARAMS })}>
               重置为默认参数
             </Button>
-            <Button block onClick={() => void exportParams()}>
+            <Button long onClick={() => void exportParams()}>
               导出参数 JSON
             </Button>
-            <Button block onClick={importParams}>
+            <Button long onClick={importParams}>
               导入参数 JSON
             </Button>
           </Space>
@@ -347,10 +347,11 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
         />
 
         <div className="stage-actions">
-          <Segmented
+          <Radio.Group
+            type="button"
             size="small"
             value={fitMode}
-            onChange={(value) => setFitMode(value as FitMode)}
+            onChange={setFitMode}
             options={[
               { label: "铺满", value: "cover" },
               { label: "适应", value: "contain" },
@@ -362,7 +363,7 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
           {running && (
             <Tag color={source === "tauri" ? "green" : "orange"}>{source === "tauri" ? "系统音频" : "模拟信号"}</Tag>
           )}
-          <Checkbox checked={bypass} onChange={(e) => setBypass(e.target.checked)}>
+          <Checkbox checked={bypass} onChange={(checked) => setBypass(checked)}>
             A/B 原图
           </Checkbox>
         </div>
@@ -371,7 +372,7 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
           <Typography.Text type="secondary">FPS {fps}</Typography.Text>
           <Space size={4}>
             <Typography.Text type="secondary">RMS</Typography.Text>
-            <Progress percent={Math.min(100, meter.rms * 100)} size={{ width: 80, height: 6 }} showInfo={false} />
+            <RmsWaveform levelRef={rmsLevelRef} />
             <Typography.Text type="secondary">{meter.rms.toFixed(3)}</Typography.Text>
           </Space>
           <Typography.Text type="secondary">
@@ -391,9 +392,8 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
         {(cameraError || glError) && (
           <Alert
             type="error"
-            showIcon
             className="stage-alert"
-            title={[glError, cameraError].filter(Boolean).join("；")}
+            content={[glError, cameraError].filter(Boolean).join("；")}
           />
         )}
       </div>
@@ -403,13 +403,20 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
           <Tabs
             className="top-tabs"
             size="small"
-            activeKey={activeFn}
+            activeTab={activeFn}
             onChange={(key) => setActiveFn(key as FunctionKey)}
-            items={TAB_ITEMS}
+          >
+            {TAB_ITEMS.map((tab) => (
+              <Tabs.TabPane key={tab.key} title={tab.label} />
+            ))}
+          </Tabs>
+          <Button
+            className="theme-toggle"
+            type="text"
+            size="small"
+            icon={themeMode === "dark" ? <IconSun /> : <IconMoon />}
+            onClick={onToggleTheme}
           />
-          <Button size="small" className="theme-toggle" onClick={onToggleTheme}>
-            {themeMode === "dark" ? "白天" : "黑夜"}
-          </Button>
         </div>
         <div className="panel">{panelContent()}</div>
       </div>
@@ -422,15 +429,17 @@ function App() {
 
   useEffect(() => {
     document.documentElement.dataset.theme = themeMode;
+    if (themeMode === "dark") {
+      document.body.setAttribute("arco-theme", "dark");
+    } else {
+      document.body.removeAttribute("arco-theme");
+    }
   }, [themeMode]);
 
   return (
-    <ConfigProvider theme={{ algorithm: themeMode === "dark" ? theme.darkAlgorithm : theme.defaultAlgorithm }}>
-      <AntApp>
-        <DemoPage themeMode={themeMode} onToggleTheme={() => setThemeMode((m) => (m === "dark" ? "light" : "dark"))} />
-      </AntApp>
-    </ConfigProvider>
+    <DemoPage themeMode={themeMode} onToggleTheme={() => setThemeMode((m) => (m === "dark" ? "light" : "dark"))} />
   );
 }
 
 export default App;
+

@@ -1,4 +1,4 @@
-import { Slider, Switch, Typography } from "antd";
+import { Slider, Switch, Typography } from "@arco-design/web-react";
 import { PARAM_DEFS, type ParamGroup, type ParamValues } from "../params/schema";
 
 interface ParamSlidersProps {
@@ -34,7 +34,7 @@ export function ParamSliders({ group, params, onChange }: ParamSlidersProps) {
               max={def.max}
               step={def.step}
               value={params[def.key]}
-              onChange={(value) => onChange(def.key, value)}
+              onChange={(value) => onChange(def.key, Array.isArray(value) ? value[0] : value)}
             />
           )}
         </div>

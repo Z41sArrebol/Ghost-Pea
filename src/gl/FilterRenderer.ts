@@ -42,6 +42,7 @@ function compileShader(gl: WebGL2RenderingContext, type: number, source: string)
 export class FilterRenderer {
   private readonly canvas: HTMLCanvasElement;
   private readonly gl: WebGL2RenderingContext;
+  private readonly program: WebGLProgram;
   private readonly texture: WebGLTexture;
   private readonly uniformLocations: Record<UniformName, WebGLUniformLocation | null>;
   private readonly uvScaleXLocation: WebGLUniformLocation | null;
@@ -55,6 +56,7 @@ export class FilterRenderer {
 
     const program = gl.createProgram();
     if (!program) throw new Error("无法创建 WebGL program");
+    this.program = program;
     gl.attachShader(program, compileShader(gl, gl.VERTEX_SHADER, VERTEX_SHADER));
     gl.attachShader(program, compileShader(gl, gl.FRAGMENT_SHADER, FRAGMENT_SHADER));
     gl.linkProgram(program);
@@ -80,6 +82,14 @@ export class FilterRenderer {
     this.uvScaleXLocation = gl.getUniformLocation(program, "uUvScaleX");
     this.uvScaleYLocation = gl.getUniformLocation(program, "uUvScaleY");
     gl.uniform1i(gl.getUniformLocation(program, "uTexture"), 0);
+  }
+
+  // 卸载时释放 program 和纹理即可。不能 loseContext：
+  // 热重载时 React 复用同一个 canvas DOM，getContext 会返回同一个上下文，
+  // 杀掉它之后这个 canvas 就永久报废，shader 再也编译不过
+  dispose(): void {
+    this.gl.deleteProgram(this.program);
+    this.gl.deleteTexture(this.texture);
   }
 
   render(video: HTMLVideoElement, values: UniformValues, fit: FitMode): void {
