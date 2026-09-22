@@ -6,12 +6,24 @@ import {
   type MoodResult,
 } from "../../packages/audio-ai/src";
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { calibrateHappySad } from "./moodCalibration";
 
 export type MoodState = "calm" | "bright" | "intense" | "dark" | "neutral";
+export type DominantMood = "happy" | "sad" | "relaxed" | "aggressive";
+export type MoodLabel = DominantMood | "neutral";
 export type AiMood = MoodResult["scores"] &
-  Pick<MoodResult, "streamEpoch" | "sequence" | "confidence" | "inferenceMs" | "modelReady">;
+  Pick<MoodResult, "streamEpoch" | "sequence" | "confidence" | "inferenceMs" | "modelReady"> & {
+    rawHappy: number;
+    rawSad: number;
+    valence: number;
+  };
+type RawAiMood = MoodResult["scores"] &
+  Pick<MoodResult, "streamEpoch" | "sequence" | "inferenceMs" | "modelReady">;
 
-const CONFIDENCE_THRESHOLD = 0.5;
+const HAPPY_VALENCE_THRESHOLD = 0.65;
+const SAD_VALENCE_THRESHOLD = 0.35;
+const AGGRESSIVE_THRESHOLD = 0.45;
+const RELAXED_THRESHOLD = 0.6;
 const AI_STALE_MS = 2500;
 const STALE_CHECK_MS = 1000;
 const BACKEND_CHECK_MS = 1000;
@@ -21,20 +33,47 @@ interface AudioMonitorStatus {
   running: boolean;
 }
 
-export function resolveMoodState(mood: AiMood | null): MoodState {
-  if (!mood || !mood.modelReady || mood.confidence < CONFIDENCE_THRESHOLD) return "neutral";
+function getDominanceConfidence(mood: MoodResult["scores"]): number {
+  const [highest = 0, secondHighest = 0] = Object.values(mood).sort((left, right) => right - left);
+  return highest > 0 ? (highest - secondHighest) / highest : 0;
+}
+
+export function resolveDominantMood(mood: AiMood | null): DominantMood | null {
+  if (!mood || !mood.modelReady) return null;
   const candidates = [
-    ["bright", mood.happy],
-    ["dark", mood.sad],
-    ["calm", mood.relaxed],
-    ["intense", mood.aggressive],
+    ["happy", mood.happy],
+    ["sad", mood.sad],
+    ["relaxed", mood.relaxed],
+    ["aggressive", mood.aggressive],
   ] as const;
   return candidates.reduce((best, cur) => (cur[1] > best[1] ? cur : best))[0];
 }
 
+export function resolveMoodLabel(mood: AiMood | null): MoodLabel {
+  if (!mood || !mood.modelReady) return "neutral";
+  if (mood.aggressive >= AGGRESSIVE_THRESHOLD) return "aggressive";
+  if (mood.valence >= HAPPY_VALENCE_THRESHOLD) return "happy";
+  if (mood.valence <= SAD_VALENCE_THRESHOLD) return "sad";
+  if (mood.relaxed >= RELAXED_THRESHOLD) return "relaxed";
+  return "neutral";
+}
+
+export function resolveMoodState(mood: AiMood | null): MoodState {
+  const moodLabel = resolveMoodLabel(mood);
+  if (moodLabel === "neutral") return "neutral";
+  return {
+    happy: "bright",
+    sad: "dark",
+    relaxed: "calm",
+    aggressive: "intense",
+  }[moodLabel] as MoodState;
+}
+
 export interface AiMoodHandle {
   mood: AiMood | null;
+  moodLabel: MoodLabel;
   moodState: MoodState;
+  dominantMood: DominantMood | null;
   workerReady: boolean;
   stale: boolean;
   status: AudioMoodStatus;
@@ -42,10 +81,10 @@ export interface AiMoodHandle {
   selfTest: () => void;
 }
 
-export function useAiMood(): AiMoodHandle {
+export function useAiMood(valenceSensitivity = 24): AiMoodHandle {
   const serviceRef = useRef<AudioMoodService | null>(null);
   const lastMoodAtRef = useRef(0);
-  const [mood, setMood] = useState<AiMood | null>(null);
+  const [rawMood, setRawMood] = useState<RawAiMood | null>(null);
   const [stale, setStale] = useState(false);
   const [status, setStatus] = useState<AudioMoodStatus>({
     phase: "idle",
@@ -61,11 +100,10 @@ export function useAiMood(): AiMoodHandle {
     const unsubscribeResult = service.subscribe((result) => {
       lastMoodAtRef.current = performance.now();
       setStale(false);
-      setMood({
+      setRawMood({
         ...result.scores,
         streamEpoch: result.streamEpoch,
         sequence: result.sequence,
-        confidence: result.confidence,
         inferenceMs: result.inferenceMs,
         modelReady: result.modelReady,
       });
@@ -101,6 +139,26 @@ export function useAiMood(): AiMoodHandle {
     };
   }, []);
 
+  const mood: AiMood | null = rawMood
+    ? (() => {
+        const calibrated = calibrateHappySad(rawMood.happy, rawMood.sad, valenceSensitivity);
+        const scores = {
+          happy: calibrated.happy,
+          sad: calibrated.sad,
+          relaxed: rawMood.relaxed,
+          aggressive: rawMood.aggressive,
+        };
+        return {
+          ...rawMood,
+          ...scores,
+          rawHappy: rawMood.happy,
+          rawSad: rawMood.sad,
+          valence: calibrated.valence,
+          confidence: getDominanceConfidence(scores),
+        };
+      })()
+    : null;
+
   useEffect(() => {
     const timer = window.setInterval(() => {
       const hasMood = lastMoodAtRef.current > 0;
@@ -118,7 +176,9 @@ export function useAiMood(): AiMoodHandle {
   const workerReady = status.phase === "running" || status.phase === "degraded";
   return {
     mood,
+    moodLabel: resolveMoodLabel(mood),
     moodState: resolveMoodState(mood),
+    dominantMood: resolveDominantMood(mood),
     workerReady,
     stale,
     status,

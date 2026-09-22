@@ -1,5 +1,6 @@
 import type { MoodResult } from "./contracts";
 import { MoodRuntime } from "./moodRuntime";
+import { getDominanceConfidence, RollingMoodScores } from "./scoreAggregation";
 import type { MainToWorkerMessage, WorkerToMainMessage } from "./workerProtocol";
 
 const workerScope = self as unknown as {
@@ -11,17 +12,18 @@ const workerScope = self as unknown as {
 let initialized = false;
 let modelReady = false;
 const runtime = new MoodRuntime();
+const scoreHistory = new RollingMoodScores();
 
 async function infer(message: Extract<MainToWorkerMessage, { type: "pcm" }>): Promise<MoodResult> {
   const startedAt = performance.now();
   const pcm = new Float32Array(message.payload);
-  const scores = await runtime.predict(pcm);
+  const scores = scoreHistory.push(message.streamEpoch, await runtime.predict(pcm));
 
   return {
     streamEpoch: message.streamEpoch,
     sequence: message.sequence,
     scores,
-    confidence: Math.max(scores.happy, scores.sad, scores.relaxed, scores.aggressive),
+    confidence: getDominanceConfidence(scores),
     inferenceMs: performance.now() - startedAt,
     modelReady,
   };
@@ -42,6 +44,7 @@ workerScope.onmessage = async (event) => {
         workerScope.postMessage({ type: "result", result: await infer(message) });
         break;
       case "dispose":
+        scoreHistory.reset();
         runtime.dispose();
         workerScope.postMessage({ type: "disposed" });
         workerScope.close();

@@ -128,16 +128,18 @@ interface MoodResult {
 | --- | --- |
 | `streamEpoch` | 音频连续性标识；丢样或重启流时变化 |
 | `sequence` | 当前 epoch 内的窗口递增序号 |
-| `scores` | 四个独立二分类器的原始正类分数 |
-| `confidence` | 综合置信度，算法待定 |
+| `scores` | 四个独立二分类器最近 8 个窗口的正类分数均值 |
+| `confidence` | 最高分相对第二名的领先比例，范围为 `0..1` |
 | `inferenceMs` | Worker 内本次推理耗时 |
 | `modelReady` | 真实模型是否已经加载 |
 
 注意：
 
 - 四个 `scores` 是独立分数，不保证总和为 `1`。
-- 前端暂时不要自行 Softmax，也不要把最大分数直接固化为最终产品状态。
-- 最终 `Neutral` 判定、平滑、迟滞和状态保持策略仍待确定。
+- 不同分类器未经过联合校准，分数绝对值和高低不能当作四分类概率解释。
+- 当前使用最近 8 个重叠窗口做算术平均；静音或 epoch 变化会清空历史。
+- `confidence = (最高分 - 第二名) / 最高分`；所有分数为零时为 `0`。
+- 最终迟滞和最短状态保持策略仍待确定。
 - `streamEpoch` 和 `sequence` 是 `bigint`。需要序列化到 JSON 时，应先转换为字符串。
 
 ## 6. 服务状态
@@ -207,16 +209,17 @@ useEffect(() => {
 - latest-only 调度。
 - 独立 Web Worker 通信。
 - 服务启停、状态订阅和结果订阅。
+- Essentia.js MusiCNN 特征提取。
+- 四个 TensorFlow.js 二分类模型加载和推理。
+- 跨窗口分数平均及领先优势置信度。
+- 静音窗口短路。
 
 当前尚未完成：
 
-- Essentia.js 特征提取。
-- TensorFlow.js 模型加载和真实推理。
-- 四个二分类分数的融合算法。
-- Neutral、平滑、迟滞和最短保持策略。
-- 最终模型资源路径与打包方式。
+- 针对目标音乐样本集的模型分数校准。
+- 最终 Neutral 阈值、迟滞和最短保持策略。
 
-因此当前 `start()` 成功后，服务会进入 `degraded`，`modelReady` 为 `false`，Worker 返回的四个分数均为 `0.25`，`confidence` 为 `0`。这些值只用于验证通信流程，前端不得将其视为真实 AI 输出。
+模型资源从 `/models/audio-ai` 加载。加载和后端连接成功后，服务进入 `running` 且 `modelReady` 为 `true`。
 
 ## 9. 错误与降级
 
