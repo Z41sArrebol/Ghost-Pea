@@ -9,6 +9,7 @@ import {
   Modal,
   Radio,
   Select,
+  Slider,
   Space,
   Tabs,
   Tag,
@@ -64,17 +65,20 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
   const [activeFn, setActiveFn] = useState<FunctionKey>("filter");
   const [fps, setFps] = useState(0);
   const [meter, setMeter] = useState<SmoothedFeatures>({ rms: 0, bass: 0, treble: 0, onset: 0, centroid: 0 });
+  const [valenceSensitivity, setValenceSensitivity] = useState(24);
 
   const { featuresRef, running, source, status, start, stop } = useAudioFeatures();
   const {
     mood,
+    moodLabel,
     moodState,
+    dominantMood,
     workerReady,
     stale,
     status: aiStatus,
     error: aiError,
     selfTest,
-  } = useAiMood();
+  } = useAiMood(valenceSensitivity);
 
   const bypassRef = useRef(bypass);
   bypassRef.current = bypass;
@@ -303,6 +307,30 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
               {stale && <Tag color="orange">结果超时</Tag>}
             </Space>
 
+            <div>
+              <Typography.Text type="secondary">AI 输出标签</Typography.Text>
+              <div style={{ marginTop: 8 }}>
+                <Tag color={moodLabel === "neutral" ? "orange" : "green"}>
+                  {moodLabel}
+                </Tag>
+                {dominantMood && <Tag style={{ marginLeft: 8 }}>最高候选：{dominantMood}</Tag>}
+              </div>
+            </div>
+
+            <div>
+              <div className="param-head">
+                <Typography.Text>快乐 / 悲伤灵敏度</Typography.Text>
+                <Typography.Text type="secondary">{valenceSensitivity.toFixed(0)}</Typography.Text>
+              </div>
+              <Slider
+                min={4}
+                max={40}
+                step={1}
+                value={valenceSensitivity}
+                onChange={(value) => setValenceSensitivity(Array.isArray(value) ? value[0] : value)}
+              />
+            </div>
+
             <div
               style={{
                 display: "grid",
@@ -311,20 +339,24 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
                 fontVariantNumeric: "tabular-nums",
               }}
             >
-              <Typography.Text type="secondary">情绪状态</Typography.Text>
-              <Typography.Text>{moodState === "neutral" ? "Neutral" : moodState}</Typography.Text>
               <Typography.Text type="secondary">Stream epoch</Typography.Text>
               <Typography.Text>{mood?.streamEpoch.toString() ?? "-"}</Typography.Text>
               <Typography.Text type="secondary">Sequence</Typography.Text>
               <Typography.Text>{mood?.sequence.toString() ?? "-"}</Typography.Text>
-              <Typography.Text type="secondary">Confidence</Typography.Text>
+              <Typography.Text type="secondary">领先置信度</Typography.Text>
               <Typography.Text>{mood ? mood.confidence.toFixed(4) : "-"}</Typography.Text>
+              <Typography.Text type="secondary">Valence</Typography.Text>
+              <Typography.Text>{mood ? mood.valence.toFixed(4) : "-"}</Typography.Text>
               <Typography.Text type="secondary">Inference</Typography.Text>
               <Typography.Text>{mood ? `${mood.inferenceMs.toFixed(1)} ms` : "-"}</Typography.Text>
-              <Typography.Text type="secondary">Happy</Typography.Text>
+              <Typography.Text type="secondary">Happy（转换）</Typography.Text>
               <Typography.Text>{mood ? mood.happy.toFixed(4) : "-"}</Typography.Text>
-              <Typography.Text type="secondary">Sad</Typography.Text>
+              <Typography.Text type="secondary">Sad（转换）</Typography.Text>
               <Typography.Text>{mood ? mood.sad.toFixed(4) : "-"}</Typography.Text>
+              <Typography.Text type="secondary">Happy（原始）</Typography.Text>
+              <Typography.Text>{mood ? mood.rawHappy.toFixed(4) : "-"}</Typography.Text>
+              <Typography.Text type="secondary">Sad（原始）</Typography.Text>
+              <Typography.Text>{mood ? mood.rawSad.toFixed(4) : "-"}</Typography.Text>
               <Typography.Text type="secondary">Relaxed</Typography.Text>
               <Typography.Text>{mood ? mood.relaxed.toFixed(4) : "-"}</Typography.Text>
               <Typography.Text type="secondary">Aggressive</Typography.Text>
@@ -334,7 +366,7 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
             {aiError && <Alert type="error" content={aiError} />}
             <Button onClick={selfTest}>重新连接 AI</Button>
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-              当前模型输出为占位值；启动音频后，每个 3 秒 PCM 窗口会在此刷新。
+              Happy/Sad 经 Valence 校准；Aggressive 和 Relaxed 保留独立激活值，四项不是总和为 1 的四分类概率。
             </Typography.Text>
           </Space>
         );
