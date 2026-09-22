@@ -16,12 +16,14 @@ import {
 } from "@arco-design/web-react";
 import { IconMoon, IconSun } from "@arco-design/web-react/icon";
 import { useAiMood } from "./ai/useAiMood";
-import { useAudioFeatures } from "./audio/useAudioFeatures";
+import { AUDIO_STALE_MS, useAudioFeatures } from "./audio/useAudioFeatures";
 import { ParamSliders } from "./components/ParamSliders";
 import { RmsWaveform } from "./components/RmsWaveform";
 import { FilterRenderer, type FitMode, type UniformValues } from "./gl/FilterRenderer";
+import { ParameterOrchestrator } from "./params/orchestrator";
 import { THEME_PRESETS } from "./params/presets";
-import { DEFAULT_PARAMS, type ParamValues } from "./params/schema";
+import { DEFAULT_PARAMS, parseParams, type ParamValues } from "./params/schema";
+import { useCamera, type CameraConfig } from "./useCamera";
 
 const STATUS_UPDATE_MS = 250;
 
@@ -36,36 +38,22 @@ const TAB_ITEMS: { key: FunctionKey; label: string }[] = [
   { key: "presets", label: "预设" },
 ];
 
-interface CameraConfig {
-  deviceId: string;
-  resolution: "auto" | "720p" | "1080p";
-  frameRate: number;
-}
-
-type SmoothedFeatures = Record<"rms" | "bass" | "treble" | "onset" | "centroid", number>;
-
-function smoothToward(current: number, target: number, dt: number, attack: number, release: number): number {
-  const tau = target > current ? attack : release;
-  return current + (target - current) * (1 - Math.exp(-dt / tau));
-}
-
 function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; onToggleTheme: () => void }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-
-  const [cameras, setCameras] = useState<MediaDeviceInfo[]>([]);
   const [cameraConfig, setCameraConfig] = useState<CameraConfig>({ deviceId: "", resolution: "auto", frameRate: 0 });
-  const [cameraError, setCameraError] = useState("");
+  const { cameras, error: cameraError, busy: cameraBusy, retry: retryCamera } = useCamera(videoRef, cameraConfig);
   const [glError, setGlError] = useState("");
+  const [glWarning, setGlWarning] = useState("");
+  const [previewAttempt, setPreviewAttempt] = useState(0);
   const [bypass, setBypass] = useState(false);
   const [fitMode, setFitMode] = useState<FitMode>("cover");
   const [params, setParams] = useState<ParamValues>({ ...DEFAULT_PARAMS });
   const [activeFn, setActiveFn] = useState<FunctionKey>("filter");
-  const [fps, setFps] = useState(0);
-  const [meter, setMeter] = useState<SmoothedFeatures>({ rms: 0, bass: 0, treble: 0, onset: 0, centroid: 0 });
+  const [frameStats, setFrameStats] = useState({ render: 0, video: 0, p95: 0 });
+  const [meter, setMeter] = useState({ rms: 0, bass: 0, treble: 0, onset: 0, centroid: 0.5 });
 
-  const { featuresRef, running, source, status, start, stop } = useAudioFeatures();
+  const { featuresRef, lastReceivedAtRef, running, source, status, busy: audioBusy, error: audioError, stale: audioStale, start, stop } = useAudioFeatures();
   const {
     mood,
     moodState,
@@ -88,120 +76,105 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
     setParams((prev) => ({ ...prev, [key]: value }));
   }, []);
 
-  const refreshCameras = useCallback(async () => {
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    setCameras(devices.filter((d) => d.kind === "videoinput"));
-  }, []);
-
-  const startCamera = useCallback(async (config: CameraConfig) => {
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    streamRef.current = null;
-    try {
-      const constraints: MediaStreamConstraints = {
-        video: {
-          ...(config.deviceId ? { deviceId: { exact: config.deviceId } } : {}),
-          ...(config.resolution === "720p" ? { width: { ideal: 1280 }, height: { ideal: 720 } } : {}),
-          ...(config.resolution === "1080p" ? { width: { ideal: 1920 }, height: { ideal: 1080 } } : {}),
-          ...(config.frameRate > 0 ? { frameRate: { ideal: config.frameRate } } : {}),
-        },
-        audio: false,
-      };
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
-      streamRef.current = stream;
-      const video = videoRef.current;
-      if (video) {
-        video.srcObject = stream;
-        await video.play();
-      }
-      setCameraError("");
-      await refreshCameras();
-    } catch (error) {
-      setCameraError(`相机不可用：${error instanceof Error ? error.message : String(error)}`);
-    }
-  }, [refreshCameras]);
-
   useEffect(() => {
-    void startCamera(cameraConfig);
-  }, [cameraConfig, startCamera]);
-
-  useEffect(() => {
-    const onDeviceChange = () => void refreshCameras();
-    navigator.mediaDevices.addEventListener("devicechange", onDeviceChange);
-    return () => navigator.mediaDevices.removeEventListener("devicechange", onDeviceChange);
-  }, [refreshCameras]);
-
-  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
     let renderer: FilterRenderer | null = null;
+    setGlError("");
+    setGlWarning("");
     try {
-      if (!canvasRef.current) throw new Error("canvas 未挂载");
-      renderer = new FilterRenderer(canvasRef.current);
+      renderer = new FilterRenderer(canvas);
     } catch (error) {
       setGlError(error instanceof Error ? error.message : String(error));
     }
-
+    const onLost = (event: Event) => {
+      event.preventDefault();
+      renderer?.dispose();
+      renderer = null;
+      setGlError("显卡上下文已中断，正在等待恢复；恢复后会自动重建预览");
+    };
+    const onRestored = () => setPreviewAttempt((value) => value + 1);
+    canvas.addEventListener("webglcontextlost", onLost);
+    canvas.addEventListener("webglcontextrestored", onRestored);
+    const orchestrator = new ParameterOrchestrator(paramsRef.current);
     let raf = 0;
     let last = performance.now();
-    let lastStatus = 0;
-    let fpsEma = 60;
-    const smoothed: SmoothedFeatures = { rms: 0, bass: 0, treble: 0, onset: 0, centroid: 0 };
+    let lastStatus = last;
+    let statsStart = last;
+    let drawn = 0;
+    let previousVideoFrames = 0;
+    let lastDrawAt = 0;
+    const intervals: number[] = [];
 
     const frame = (now: number) => {
-      const dt = Math.min(0.1, (now - last) / 1000);
+      const dt = Math.min(0.1, Math.max(0, (now - last) / 1000));
       last = now;
-      if (dt > 0) fpsEma = fpsEma * 0.9 + (1 / dt) * 0.1;
-
-      const p = paramsRef.current;
-      const features = featuresRef.current;
-      // 静音回落开启时，静音帧把动态通道目标归零，平滑回到基础值
-      const silent = features.silence && p.silenceFallback > 0.5;
-      smoothed.rms = smoothToward(smoothed.rms, silent ? 0 : features.rms, dt, p.rmsAttack, p.rmsRelease);
-      smoothed.bass = smoothToward(smoothed.bass, silent ? 0 : features.bass, dt, p.bassAttack, p.bassRelease);
-      smoothed.treble = smoothToward(smoothed.treble, silent ? 0 : features.treble, dt, p.trebleAttack, p.trebleRelease);
-      smoothed.onset = smoothToward(smoothed.onset, silent ? 0 : features.onset, dt, p.onsetAttack, p.onsetRelease);
-      smoothed.centroid = smoothToward(smoothed.centroid, features.centroid, dt, p.centroidAttack, p.centroidRelease);
-      rmsLevelRef.current = smoothed.rms;
-
+      const receivedAt = lastReceivedAtRef.current;
+      const available = receivedAt !== null && now - receivedAt <= AUDIO_STALE_MS;
+      const p = orchestrator.update(paramsRef.current, featuresRef.current, available, dt);
+      rmsLevelRef.current = orchestrator.features.rms;
       if (renderer && videoRef.current) {
         const uniforms: UniformValues = {
           uTime: now / 1000,
-          uRms: smoothed.rms,
-          uBass: smoothed.bass,
-          uTreble: smoothed.treble,
-          uOnset: smoothed.onset,
-          uCentroid: smoothed.centroid,
-          uIntensity: p.intensity,
           uBypass: bypassRef.current ? 1 : 0,
-          uBaseContrast: p.baseContrast,
+          uContrast: p.contrast,
           uBrightness: p.brightness,
-          uVignette: p.vignette,
-          uGrainBase: p.grainBase,
-          uHighlightThr: p.highlightThr,
+          uTemperature: p.temperature,
           uShadowCool: p.shadowCool,
-          uMapRmsGlow: p.mapRmsGlow,
-          uMapBassWarm: p.mapBassWarm,
-          uMapTrebleGrain: p.mapTrebleGrain,
-          uMapOnsetContrast: p.mapOnsetContrast,
-          uMapCentroidTemp: p.mapCentroidTemp,
+          uHighlightThr: p.highlightThr,
+          uVignette: p.vignette,
+          uGrain: p.grain,
+          uBloom: orchestrator.params.bloomEnabled ? p.bloom : 0,
+          uBloomWarm: orchestrator.params.bloomEnabled ? p.bloomWarm : 0,
+          uLookDark: p.lookDark,
+          uLookCalm: p.lookCalm,
+          uLookBright: p.lookBright,
         };
-        renderer.render(videoRef.current, uniforms, fitModeRef.current);
+        try {
+          if (renderer.render(videoRef.current, uniforms, fitModeRef.current)) {
+            drawn++;
+            if (lastDrawAt > 0) {
+              intervals.push(now - lastDrawAt);
+              if (intervals.length > 120) intervals.shift();
+            }
+            lastDrawAt = now;
+          } else {
+            lastDrawAt = 0;
+          }
+        } catch (error) {
+          renderer.dispose();
+          renderer = null;
+          setGlError(`预览已暂停：${error instanceof Error ? error.message : String(error)}`);
+        }
       }
-
-      if (now - lastStatus > STATUS_UPDATE_MS) {
+      if (now - lastStatus >= STATUS_UPDATE_MS) {
         lastStatus = now;
-        setFps(Math.round(fpsEma));
-        setMeter({ ...smoothed });
+        setMeter({ ...orchestrator.features });
+        setGlWarning(renderer?.warning ?? "");
+      }
+      if (now - statsStart >= 1000) {
+        const seconds = (now - statsStart) / 1000;
+        const videoFrames = renderer?.videoFrames ?? previousVideoFrames;
+        const sorted = [...intervals].sort((a, b) => a - b);
+        setFrameStats({
+          render: Math.round(drawn / seconds),
+          video: Math.round((videoFrames - previousVideoFrames) / seconds),
+          p95: drawn ? Math.round(sorted[Math.max(0, Math.ceil(sorted.length * 0.95) - 1)] ?? 0) : 0,
+        });
+        previousVideoFrames = videoFrames;
+        drawn = 0;
+        statsStart = now;
       }
       raf = requestAnimationFrame(frame);
     };
     raf = requestAnimationFrame(frame);
-
     return () => {
       cancelAnimationFrame(raf);
+      canvas.removeEventListener("webglcontextlost", onLost);
+      canvas.removeEventListener("webglcontextrestored", onRestored);
       renderer?.dispose();
-      streamRef.current?.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
     };
-  }, [featuresRef]);
+  }, [featuresRef, lastReceivedAtRef, previewAttempt]);
 
   const exportParams = useCallback(async () => {
     const json = JSON.stringify(params, null, 2);
@@ -231,17 +204,10 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
       ),
       onOk: () => {
         try {
-          const parsed: unknown = JSON.parse(text);
-          if (typeof parsed !== "object" || parsed === null) throw new Error("not an object");
-          const merged = { ...paramsRef.current };
-          for (const key of Object.keys(DEFAULT_PARAMS)) {
-            const value = Number((parsed as Record<string, unknown>)[key]);
-            if (Number.isFinite(value)) merged[key] = value;
-          }
-          setParams(merged);
+          setParams(parseParams(JSON.parse(text), paramsRef.current));
           Message.success("参数已导入");
-        } catch {
-          Message.error("JSON 解析失败，未做任何修改");
+        } catch (error) {
+          Message.error(`${error instanceof Error ? error.message : "参数无效"}，未做任何修改`);
         }
       },
     });
@@ -334,7 +300,7 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
             {aiError && <Alert type="error" content={aiError} />}
             <Button onClick={selfTest}>重新连接 AI</Button>
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-              当前模型输出为占位值；启动音频后，每个 3 秒 PCM 窗口会在此刷新。
+              {aiStatus.modelReady ? "模型已就绪" : "模型尚未就绪"}；此处只展示分析结果，不直接控制滤镜。
             </Typography.Text>
           </Space>
         );
@@ -404,26 +370,36 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
               { label: "适应", value: "contain" },
             ]}
           />
-          <Button size="small" type="primary" onClick={() => void (running ? stop() : start())}>
+          <Button size="small" type="primary" loading={audioBusy} disabled={audioBusy} onClick={() => void (running ? stop() : start())}>
             {running ? "停止音频" : "开始音频"}
           </Button>
           {running && (
-            <Tag color={source === "tauri" ? "green" : "orange"}>{source === "tauri" ? "系统音频" : "模拟信号"}</Tag>
+            <Tag color={audioStale ? "orange" : source === "tauri" ? "green" : "orange"}>
+              {audioStale ? "音频信号中断" : source === "tauri" ? "系统音频" : "模拟信号"}
+            </Tag>
           )}
           <Checkbox checked={bypass} onChange={(checked) => setBypass(checked)}>
             A/B 原图
           </Checkbox>
+          {(cameraError || glError || glWarning) && (
+            <Button size="small" disabled={cameraBusy} onClick={() => {
+              if (cameraError) retryCamera();
+              setPreviewAttempt((value) => value + 1);
+            }}>重试预览</Button>
+          )}
         </div>
 
         <div className="stage-stats">
-          <Typography.Text type="secondary">FPS {fps}</Typography.Text>
+          <Typography.Text type="secondary">渲染 {frameStats.render} FPS · 视频 {frameStats.video} FPS</Typography.Text>
+          <Typography.Text type="secondary">帧间隔 P95 {frameStats.p95} ms</Typography.Text>
+          {cameraBusy && <Tag color="orange">相机连接中</Tag>}
           <Space size={4}>
             <Typography.Text type="secondary">RMS</Typography.Text>
             <RmsWaveform levelRef={rmsLevelRef} />
             <Typography.Text type="secondary">{meter.rms.toFixed(3)}</Typography.Text>
           </Space>
           <Typography.Text type="secondary">
-            B {(meter.bass * 100).toFixed(0)}% M {((1 - meter.bass - meter.treble) * 100).toFixed(0)}% T {(meter.treble * 100).toFixed(0)}%
+            B {(featuresRef.current.bass * 100).toFixed(0)}% M {(featuresRef.current.mid * 100).toFixed(0)}% T {(featuresRef.current.treble * 100).toFixed(0)}%
           </Typography.Text>
           {status && (
             <Typography.Text type="secondary">
@@ -436,11 +412,11 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
           </Tag>
         </div>
 
-        {(cameraError || glError) && (
+        {(cameraError || glError || audioError || glWarning) && (
           <Alert
-            type="error"
+            type={cameraError || glError || audioError ? "error" : "warning"}
             className="stage-alert"
-            content={[glError, cameraError].filter(Boolean).join("；")}
+            content={[glError, cameraError, audioError, glWarning].filter(Boolean).join("；")}
           />
         )}
       </div>

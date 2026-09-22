@@ -1,6 +1,3 @@
-// 参数 schema：面板的唯一真源。加参数 = 在这里加一条定义 + DEFAULT_PARAMS 加默认值，
-// 面板和 shader uniform 传参都从这里派生，UI 不需要改。
-
 export type ParamGroup = "filter" | "mapping" | "orchestrator";
 
 export type ParamValues = Record<string, number>;
@@ -14,6 +11,7 @@ interface SliderDef {
   max: number;
   step: number;
   unit?: string;
+  hidden?: boolean;
 }
 
 interface SwitchDef {
@@ -26,22 +24,23 @@ interface SwitchDef {
 export type ParamDef = SliderDef | SwitchDef;
 
 export const PARAM_DEFS: ParamDef[] = [
-  // ---- 滤镜基础（shader 静态参数）----
   { kind: "slider", key: "baseContrast", label: "基础对比度", group: "filter", min: 0.5, max: 2, step: 0.01 },
   { kind: "slider", key: "brightness", label: "整体亮度", group: "filter", min: 0.5, max: 1.5, step: 0.01 },
   { kind: "slider", key: "vignette", label: "暗角强度", group: "filter", min: 0, max: 1, step: 0.01 },
-  { kind: "slider", key: "grainBase", label: "颗粒基础量", group: "filter", min: 0, max: 0.2, step: 0.005 },
+  { kind: "slider", key: "grainBase", label: "颗粒基础量", group: "filter", min: 0, max: 0.15, step: 0.005 },
   { kind: "slider", key: "highlightThr", label: "高光阈值", group: "filter", min: 0.3, max: 0.9, step: 0.01 },
   { kind: "slider", key: "shadowCool", label: "阴影冷化", group: "filter", min: 0, max: 1, step: 0.01 },
+  { kind: "switch", key: "bloomEnabled", label: "高光扩散", group: "filter" },
+  { kind: "slider", key: "lookDark", label: "Dark 风格权重", group: "filter", min: 0, max: 1, step: 0.01, hidden: true },
+  { kind: "slider", key: "lookCalm", label: "Calm 风格权重", group: "filter", min: 0, max: 1, step: 0.01, hidden: true },
+  { kind: "slider", key: "lookBright", label: "Bright 风格权重", group: "filter", min: 0, max: 1, step: 0.01, hidden: true },
 
-  // ---- 音频映射系数（特征对画面的影响力，0 = 关闭该路映射）----
   { kind: "slider", key: "mapRmsGlow", label: "RMS → 光晕", group: "mapping", min: 0, max: 2, step: 0.01 },
   { kind: "slider", key: "mapBassWarm", label: "Bass → 暖色扩散", group: "mapping", min: 0, max: 2, step: 0.01 },
   { kind: "slider", key: "mapTrebleGrain", label: "Treble → 颗粒活跃", group: "mapping", min: 0, max: 0.3, step: 0.005 },
   { kind: "slider", key: "mapOnsetContrast", label: "Onset → 瞬时对比", group: "mapping", min: 0, max: 1, step: 0.01 },
   { kind: "slider", key: "mapCentroidTemp", label: "Centroid → 色温", group: "mapping", min: 0, max: 2, step: 0.01 },
 
-  // ---- 编排器（平滑时间常数 + 全局强度 + 静音回落）----
   { kind: "slider", key: "rmsAttack", label: "RMS Attack", group: "orchestrator", min: 0.01, max: 1, step: 0.01, unit: "s" },
   { kind: "slider", key: "rmsRelease", label: "RMS Release", group: "orchestrator", min: 0.05, max: 2, step: 0.01, unit: "s" },
   { kind: "slider", key: "bassAttack", label: "Bass Attack", group: "orchestrator", min: 0.01, max: 1, step: 0.01, unit: "s" },
@@ -56,7 +55,6 @@ export const PARAM_DEFS: ParamDef[] = [
   { kind: "switch", key: "silenceFallback", label: "静音回落", group: "orchestrator" },
 ];
 
-// 默认值 = 当前 Dark/Tension 演示效果的手感
 export const DEFAULT_PARAMS: ParamValues = {
   baseContrast: 1.12,
   brightness: 0.95,
@@ -64,6 +62,10 @@ export const DEFAULT_PARAMS: ParamValues = {
   grainBase: 0.03,
   highlightThr: 0.55,
   shadowCool: 0.35,
+  bloomEnabled: 1,
+  lookDark: 1,
+  lookCalm: 0,
+  lookBright: 0,
   mapRmsGlow: 0.7,
   mapBassWarm: 1,
   mapTrebleGrain: 0.12,
@@ -82,3 +84,33 @@ export const DEFAULT_PARAMS: ParamValues = {
   intensity: 0.8,
   silenceFallback: 1,
 };
+
+export function parseParams(input: unknown, current: ParamValues): ParamValues {
+  if (
+    typeof input !== "object" || input === null ||
+    (Object.getPrototypeOf(input) !== Object.prototype && Object.getPrototypeOf(input) !== null)
+  ) {
+    throw new Error("参数必须是 JSON 对象，不能是数组、null 或其他类型；未修改任何参数。");
+  }
+
+  const next = { ...current };
+  for (const def of PARAM_DEFS) {
+    const property = Object.getOwnPropertyDescriptor(input, def.key);
+    if (!property) continue;
+    const value: unknown = property.value;
+    const expected = def.kind === "switch" ? "数字 0 或 1" : `${def.min} 到 ${def.max} 之间的有限数字`;
+    if (
+      typeof value !== "number" || !Number.isFinite(value) ||
+      (def.kind === "switch" ? value !== 0 && value !== 1 : value < def.min || value > def.max)
+    ) {
+      throw new Error(`参数「${def.label}」(${def.key}) 必须是${expected}，不接受字符串或布尔值；未修改任何参数。`);
+    }
+    next[def.key] = value;
+  }
+
+  // 剩余权重留给原始色彩；仅容忍浮点加法误差，不静默重分配用户权重。
+  if (next.lookDark + next.lookCalm + next.lookBright > 1 + 1e-9) {
+    throw new Error("lookDark、lookCalm、lookBright 合计不能超过 1；请同时调低其他风格权重后重试，未修改任何参数。");
+  }
+  return next;
+}

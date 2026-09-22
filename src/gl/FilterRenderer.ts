@@ -1,149 +1,311 @@
-import { FRAGMENT_SHADER, VERTEX_SHADER } from "./shaders";
+import { createLut, LUT_SIZE, type Look } from "./luts";
+import { BLUR_SHADER, FRAGMENT_SHADER, HIGHLIGHT_SHADER, VERTEX_SHADER } from "./shaders";
 
 const FLOAT_UNIFORMS = [
-  "uTime",
-  "uRms",
-  "uBass",
-  "uTreble",
-  "uOnset",
-  "uCentroid",
-  "uIntensity",
-  "uBypass",
-  "uBaseContrast",
-  "uBrightness",
-  "uVignette",
-  "uGrainBase",
-  "uHighlightThr",
-  "uShadowCool",
-  "uMapRmsGlow",
-  "uMapBassWarm",
-  "uMapTrebleGrain",
-  "uMapOnsetContrast",
-  "uMapCentroidTemp",
+  "uTime", "uBypass", "uContrast", "uBrightness", "uTemperature", "uShadowCool",
+  "uHighlightThr", "uVignette", "uGrain", "uBloom", "uBloomWarm",
+  "uLookDark", "uLookCalm", "uLookBright",
 ] as const;
 
-export type UniformName = (typeof FLOAT_UNIFORMS)[number];
-
-export type UniformValues = Record<UniformName, number>;
-
+export type UniformValues = Record<(typeof FLOAT_UNIFORMS)[number], number>;
 export type FitMode = "cover" | "contain";
 
-function compileShader(gl: WebGL2RenderingContext, type: number, source: string): WebGLShader {
-  const shader = gl.createShader(type);
-  if (!shader) throw new Error("无法创建 shader");
-  gl.shaderSource(shader, source);
-  gl.compileShader(shader);
-  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-    throw new Error(`shader 编译失败: ${gl.getShaderInfoLog(shader) ?? "未知错误"}`);
-  }
-  return shader;
+type Program = { handle: WebGLProgram; uniforms: Map<string, WebGLUniformLocation | null> };
+type Target = { texture: WebGLTexture; framebuffer: WebGLFramebuffer };
+
+export function boundedSize(width: number, height: number, maxSide: number, maxPixels: number): [number, number] {
+  const scale = Math.min(1, maxSide / Math.max(width, height), Math.sqrt(maxPixels / (width * height)));
+  return [Math.max(1, Math.floor(width * scale)), Math.max(1, Math.floor(height * scale))];
 }
 
 export class FilterRenderer {
-  private readonly canvas: HTMLCanvasElement;
   private readonly gl: WebGL2RenderingContext;
-  private readonly program: WebGLProgram;
-  private readonly texture: WebGLTexture;
-  private readonly uniformLocations: Record<UniformName, WebGLUniformLocation | null>;
-  private readonly uvScaleXLocation: WebGLUniformLocation | null;
-  private readonly uvScaleYLocation: WebGLUniformLocation | null;
+  private readonly programs: Program[] = [];
+  private readonly textures: WebGLTexture[] = [];
+  private readonly targets: Target[] = [];
+  private readonly luts: WebGLTexture[] = [];
+  private vao: WebGLVertexArrayObject | null = null;
+  private source!: WebGLTexture;
+  private emptyBloom!: WebGLTexture;
+  private composite!: Program;
+  private highlight!: Program;
+  private blur!: Program;
+  private bloomWidth = 0;
+  private bloomHeight = 0;
+  private bloomFailed = false;
+  private disposed = false;
+  private video: HTMLVideoElement | null = null;
+  private stream: HTMLVideoElement["srcObject"] = null;
+  private videoCallback: number | null = null;
+  private videoGeneration = 0;
+  private dirty = true;
+  private hasFrame = false;
+  private lastVideoTime = -1;
+  private lastPresented = 0;
+  private lastQualityFrames = 0;
+  private sourceWidth = 0;
+  private sourceHeight = 0;
+  videoFrames = 0;
+  uploads = 0;
+  warning: string | null = null;
 
-  constructor(canvas: HTMLCanvasElement) {
-    const gl = canvas.getContext("webgl2", { antialias: false });
+  constructor(private readonly canvas: HTMLCanvasElement) {
+    const gl = canvas.getContext("webgl2", { antialias: false, alpha: false });
     if (!gl) throw new Error("当前环境不支持 WebGL2");
-    this.canvas = canvas;
     this.gl = gl;
-
-    const program = gl.createProgram();
-    if (!program) throw new Error("无法创建 WebGL program");
-    this.program = program;
-    gl.attachShader(program, compileShader(gl, gl.VERTEX_SHADER, VERTEX_SHADER));
-    gl.attachShader(program, compileShader(gl, gl.FRAGMENT_SHADER, FRAGMENT_SHADER));
-    gl.linkProgram(program);
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-      throw new Error(`program 链接失败: ${gl.getProgramInfoLog(program) ?? "未知错误"}`);
+    try {
+      this.vao = gl.createVertexArray();
+      if (!this.vao) throw new Error("无法创建绘制资源");
+      this.composite = this.createProgram(FRAGMENT_SHADER);
+      this.highlight = this.createProgram(HIGHLIGHT_SHADER);
+      this.blur = this.createProgram(BLUR_SHADER);
+      this.source = this.createTexture2D();
+      this.emptyBloom = this.createTexture2D();
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+      for (const look of ["dark", "calm", "bright"] as Look[]) {
+        const texture = gl.createTexture();
+        if (!texture) throw new Error("无法创建调色纹理");
+        this.textures.push(texture);
+        this.luts.push(texture);
+        gl.bindTexture(gl.TEXTURE_3D, texture);
+        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+        gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA8, LUT_SIZE, LUT_SIZE, LUT_SIZE, 0, gl.RGBA, gl.UNSIGNED_BYTE, createLut(look));
+      }
+      if (gl.getError() !== gl.NO_ERROR) throw new Error("显卡资源初始化失败，请关闭其他高负载程序后重试");
+    } catch (error) {
+      this.dispose();
+      throw error;
     }
-    gl.useProgram(program);
+  }
 
+  private createProgram(fragment: string): Program {
+    const gl = this.gl;
+    const shaders: WebGLShader[] = [];
+    const handle = gl.createProgram();
+    if (!handle) throw new Error("无法创建 WebGL program");
+    try {
+      for (const [type, source] of [[gl.VERTEX_SHADER, VERTEX_SHADER], [gl.FRAGMENT_SHADER, fragment]] as const) {
+        const shader = gl.createShader(type);
+        if (!shader) throw new Error("无法创建 shader");
+        shaders.push(shader);
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(shader) || "shader 编译失败");
+        gl.attachShader(handle, shader);
+      }
+      gl.linkProgram(handle);
+      if (!gl.getProgramParameter(handle, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(handle) || "shader 链接失败");
+      const names = [...FLOAT_UNIFORMS, "uTexture", "uBloomTexture", "uDarkLut", "uCalmLut", "uBrightLut", "uUvScaleX", "uUvScaleY", "uDirection"];
+      const program = { handle, uniforms: new Map(names.map((name) => [name, gl.getUniformLocation(handle, name)])) };
+      this.programs.push(program);
+      return program;
+    } catch (error) {
+      gl.deleteProgram(handle);
+      throw error;
+    } finally {
+      for (const shader of shaders) gl.deleteShader(shader);
+    }
+  }
+
+  private createTexture2D(): WebGLTexture {
+    const gl = this.gl;
     const texture = gl.createTexture();
     if (!texture) throw new Error("无法创建纹理");
-    this.texture = texture;
+    this.textures.push(texture);
+    gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, texture);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    // 视频解码出来的帧是倒置的，上传时翻转回来
-    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-
-    this.uniformLocations = Object.fromEntries(
-      FLOAT_UNIFORMS.map((name) => [name, gl.getUniformLocation(program, name)]),
-    ) as Record<UniformName, WebGLUniformLocation | null>;
-    this.uvScaleXLocation = gl.getUniformLocation(program, "uUvScaleX");
-    this.uvScaleYLocation = gl.getUniformLocation(program, "uUvScaleY");
-    gl.uniform1i(gl.getUniformLocation(program, "uTexture"), 0);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]));
+    return texture;
   }
 
-  // 卸载时释放 program 和纹理即可。不能 loseContext：
-  // 热重载时 React 复用同一个 canvas DOM，getContext 会返回同一个上下文，
-  // 杀掉它之后这个 canvas 就永久报废，shader 再也编译不过
-  dispose(): void {
-    this.gl.deleteProgram(this.program);
-    this.gl.deleteTexture(this.texture);
-  }
-
-  render(video: HTMLVideoElement, values: UniformValues, fit: FitMode): void {
-    const { gl } = this;
-    if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-      this.resize(video, fit);
-      gl.bindTexture(gl.TEXTURE_2D, this.texture);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+  private bindVideo(video: HTMLVideoElement): void {
+    if (this.video === video && this.stream === video.srcObject) return;
+    this.cancelVideoCallback();
+    this.video = video;
+    this.stream = video.srcObject;
+    this.dirty = true;
+    this.hasFrame = false;
+    this.lastVideoTime = -1;
+    this.lastPresented = 0;
+    this.lastQualityFrames = video.getVideoPlaybackQuality?.().totalVideoFrames ?? 0;
+    const generation = this.videoGeneration;
+    if (typeof video.requestVideoFrameCallback === "function") {
+      const onFrame: VideoFrameRequestCallback = (_now, metadata) => {
+        if (this.disposed || generation !== this.videoGeneration || this.stream !== video.srcObject) return;
+        this.videoFrames += this.lastPresented > 0 ? Math.max(1, metadata.presentedFrames - this.lastPresented) : 1;
+        this.lastPresented = metadata.presentedFrames;
+        this.dirty = true;
+        this.videoCallback = video.requestVideoFrameCallback(onFrame);
+      };
+      this.videoCallback = video.requestVideoFrameCallback(onFrame);
     }
-    let uvScaleX = 1;
-    let uvScaleY = 1;
-    if (fit === "cover" && video.videoWidth && video.videoHeight && this.canvas.width && this.canvas.height) {
-      const canvasAspect = this.canvas.width / this.canvas.height;
-      const videoAspect = video.videoWidth / video.videoHeight;
-      if (canvasAspect > videoAspect) {
-        uvScaleY = videoAspect / canvasAspect;
-      } else {
-        uvScaleX = canvasAspect / videoAspect;
+  }
+
+  private cancelVideoCallback(): void {
+    this.videoGeneration++;
+    if (this.videoCallback !== null) this.video?.cancelVideoFrameCallback(this.videoCallback);
+    this.videoCallback = null;
+  }
+
+  private prepareBloom(): void {
+    const gl = this.gl;
+    const [width, height] = boundedSize(Math.max(1, this.canvas.width / 4), Math.max(1, this.canvas.height / 4), 512, 131072);
+    if (width === this.bloomWidth && height === this.bloomHeight) return;
+    while (this.targets.length < 2) {
+      const framebuffer = gl.createFramebuffer();
+      if (!framebuffer) throw new Error("无法创建光晕缓冲");
+      try {
+        this.targets.push({ texture: this.createTexture2D(), framebuffer });
+      } catch (error) {
+        gl.deleteFramebuffer(framebuffer);
+        throw error;
       }
     }
-    for (const name of FLOAT_UNIFORMS) {
-      gl.uniform1f(this.uniformLocations[name], values[name]);
+    for (const target of this.targets) {
+      gl.bindTexture(gl.TEXTURE_2D, target.texture);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, target.framebuffer);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, target.texture, 0);
+      if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error("光晕缓冲不可用");
     }
-    gl.uniform1f(this.uvScaleXLocation, uvScaleX);
-    gl.uniform1f(this.uvScaleYLocation, uvScaleY);
+    if (gl.getError() !== gl.NO_ERROR) throw new Error("光晕缓冲分配失败");
+    this.bloomWidth = width;
+    this.bloomHeight = height;
+  }
+
+  private bindPass(program: Program, framebuffer: WebGLFramebuffer | null, width: number, height: number, texture: WebGLTexture): void {
+    const gl = this.gl;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+    gl.viewport(0, 0, width, height);
+    gl.useProgram(program.handle);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.uniform1i(program.uniforms.get("uTexture") ?? null, 0);
+  }
+
+  private setGrade(program: Program, values: UniformValues, scaleX: number, scaleY: number): void {
+    const gl = this.gl;
+    for (const name of FLOAT_UNIFORMS) gl.uniform1f(program.uniforms.get(name) ?? null, values[name]);
+    gl.uniform1f(program.uniforms.get("uUvScaleX") ?? null, scaleX);
+    gl.uniform1f(program.uniforms.get("uUvScaleY") ?? null, scaleY);
+    for (const [index, name] of ["uDarkLut", "uCalmLut", "uBrightLut"].entries()) {
+      gl.activeTexture(gl.TEXTURE0 + index + 2);
+      gl.bindTexture(gl.TEXTURE_3D, this.luts[index]);
+      gl.uniform1i(program.uniforms.get(name) ?? null, index + 2);
+    }
+  }
+
+  render(video: HTMLVideoElement, values: UniformValues, fit: FitMode): boolean {
+    const gl = this.gl;
+    if (this.disposed || gl.isContextLost()) return false;
+    this.bindVideo(video);
+    this.resize(video, fit);
+    if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+      if (typeof video.requestVideoFrameCallback !== "function" && video.currentTime !== this.lastVideoTime) {
+        const count = video.getVideoPlaybackQuality?.().totalVideoFrames ?? 0;
+        this.videoFrames += count > this.lastQualityFrames ? count - this.lastQualityFrames : 1;
+        this.lastQualityFrames = count;
+        this.dirty = true;
+      }
+      if (this.dirty) {
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, this.source);
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+        if (this.sourceWidth !== video.videoWidth || this.sourceHeight !== video.videoHeight) {
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+          this.sourceWidth = video.videoWidth;
+          this.sourceHeight = video.videoHeight;
+        } else {
+          gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, video);
+        }
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+        this.lastVideoTime = video.currentTime;
+        this.hasFrame = true;
+        this.dirty = false;
+        this.uploads++;
+      }
+    }
+    if (!this.hasFrame || video.readyState < 2) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.clearColor(0, 0, 0, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      return false;
+    }
+    gl.bindVertexArray(this.vao);
+    gl.disable(gl.BLEND);
+    gl.disable(gl.DEPTH_TEST);
+    const canvasAspect = this.canvas.width / this.canvas.height;
+    const videoAspect = video.videoWidth / video.videoHeight;
+    const scaleX = fit === "cover" ? Math.min(1, canvasAspect / videoAspect) : 1;
+    const scaleY = fit === "cover" ? Math.min(1, videoAspect / canvasAspect) : 1;
+    let bloomTexture = this.emptyBloom;
+    let bloomActive = values.uBypass < 0.5 && values.uBloom + values.uBloomWarm > 0.001 && !this.bloomFailed;
+    if (bloomActive) {
+      try {
+        gl.activeTexture(gl.TEXTURE0);
+        this.prepareBloom();
+      } catch (error) {
+        this.bloomFailed = true;
+        bloomActive = false;
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        for (const target of this.targets.splice(0)) {
+          gl.deleteFramebuffer(target.framebuffer);
+          gl.deleteTexture(target.texture);
+          this.textures.splice(this.textures.indexOf(target.texture), 1);
+        }
+        this.warning = `已关闭光晕，保留基础滤镜：${String(error)}`;
+      }
+    }
+    if (bloomActive) {
+      const [a, b] = this.targets;
+      this.bindPass(this.highlight, a.framebuffer, this.bloomWidth, this.bloomHeight, this.source);
+      this.setGrade(this.highlight, values, scaleX, scaleY);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      this.bindPass(this.blur, b.framebuffer, this.bloomWidth, this.bloomHeight, a.texture);
+      gl.uniform2f(this.blur.uniforms.get("uDirection") ?? null, 1 / this.bloomWidth, 0);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      this.bindPass(this.blur, a.framebuffer, this.bloomWidth, this.bloomHeight, b.texture);
+      gl.uniform2f(this.blur.uniforms.get("uDirection") ?? null, 0, 1 / this.bloomHeight);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      bloomTexture = a.texture;
+    }
+    this.bindPass(this.composite, null, this.canvas.width, this.canvas.height, this.source);
+    this.setGrade(this.composite, values, scaleX, scaleY);
+    gl.uniform1f(this.composite.uniforms.get("uBloom") ?? null, bloomActive ? values.uBloom : 0);
+    gl.uniform1f(this.composite.uniforms.get("uBloomWarm") ?? null, bloomActive ? values.uBloomWarm : 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, bloomTexture);
+    gl.uniform1i(this.composite.uniforms.get("uBloomTexture") ?? null, 1);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+    return true;
   }
 
   private resize(video: HTMLVideoElement, fit: FitMode): void {
-    if (fit === "cover") {
-      // cover 模式画布跟随显示区域尺寸，由 CSS 撑满 stage
-      const cssWidth = this.canvas.clientWidth;
-      const cssHeight = this.canvas.clientHeight;
-      if (!cssWidth || !cssHeight) return;
-      const scale = Math.min(1, 1920 / cssWidth);
-      const targetWidth = Math.round(cssWidth * scale);
-      const targetHeight = Math.round(cssHeight * scale);
-      if (this.canvas.width !== targetWidth || this.canvas.height !== targetHeight) {
-        this.canvas.width = targetWidth;
-        this.canvas.height = targetHeight;
-        this.gl.viewport(0, 0, targetWidth, targetHeight);
-      }
-      return;
-    }
-    const width = video.videoWidth;
-    const height = video.videoHeight;
+    const width = fit === "cover" ? this.canvas.clientWidth : video.videoWidth;
+    const height = fit === "cover" ? this.canvas.clientHeight : video.videoHeight;
     if (!width || !height) return;
-    const scale = Math.min(1, 1920 / width);
-    const targetWidth = Math.round(width * scale);
-    const targetHeight = Math.round(height * scale);
+    const [targetWidth, targetHeight] = boundedSize(width, height, 1920, 1920 * 1080);
     if (this.canvas.width !== targetWidth || this.canvas.height !== targetHeight) {
       this.canvas.width = targetWidth;
       this.canvas.height = targetHeight;
-      this.gl.viewport(0, 0, targetWidth, targetHeight);
     }
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.cancelVideoCallback();
+    for (const target of this.targets) this.gl.deleteFramebuffer(target.framebuffer);
+    for (const texture of this.textures) this.gl.deleteTexture(texture);
+    for (const program of this.programs) this.gl.deleteProgram(program.handle);
+    this.gl.deleteVertexArray(this.vao);
   }
 }
