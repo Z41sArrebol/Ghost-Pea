@@ -1,12 +1,25 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { AiMood, MainToWorker, WorkerToMain } from "./messages";
+import {
+  createTauriAudioMoodService,
+  type AudioMoodService,
+  type AudioMoodStatus,
+  type MoodResult,
+} from "../../packages/audio-ai/src";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 
-// 契约 5.3 映射到产品氛围状态（架构 §4.5 慢速状态表）
 export type MoodState = "calm" | "bright" | "intense" | "dark" | "neutral";
+export type AiMood = MoodResult["scores"] &
+  Pick<MoodResult, "streamEpoch" | "sequence" | "confidence" | "inferenceMs" | "modelReady">;
 
 const CONFIDENCE_THRESHOLD = 0.5;
 const AI_STALE_MS = 2500;
 const STALE_CHECK_MS = 1000;
+const BACKEND_CHECK_MS = 1000;
+const MODEL_BASE_URL = "/models/audio-ai";
+
+interface AudioMonitorStatus {
+  running: boolean;
+}
 
 export function resolveMoodState(mood: AiMood | null): MoodState {
   if (!mood || !mood.modelReady || mood.confidence < CONFIDENCE_THRESHOLD) return "neutral";
@@ -23,42 +36,68 @@ export interface AiMoodHandle {
   mood: AiMood | null;
   moodState: MoodState;
   workerReady: boolean;
-  // true = 超过 AI_STALE_MS 没收到输出。按契约此时保持当前状态，不回落
   stale: boolean;
-  sendPcm: (buffer: ArrayBuffer, capturedAtUs: number) => void;
+  status: AudioMoodStatus;
+  error: string | null;
   selfTest: () => void;
 }
 
 export function useAiMood(): AiMoodHandle {
-  const workerRef = useRef<Worker | null>(null);
+  const serviceRef = useRef<AudioMoodService | null>(null);
   const lastMoodAtRef = useRef(0);
   const [mood, setMood] = useState<AiMood | null>(null);
-  const [workerReady, setWorkerReady] = useState(false);
   const [stale, setStale] = useState(false);
+  const [status, setStatus] = useState<AudioMoodStatus>({
+    phase: "idle",
+    modelReady: false,
+    backendConnected: false,
+    lastError: null,
+  });
 
   useEffect(() => {
-    const worker = new Worker(new URL("./mood.worker.ts", import.meta.url), { type: "module" });
-    workerRef.current = worker;
-    worker.onmessage = (event: MessageEvent<WorkerToMain>) => {
-      const message = event.data;
-      switch (message.type) {
-        case "ready":
-          setWorkerReady(true);
-          break;
-        case "mood":
-          lastMoodAtRef.current = performance.now();
-          setStale(false);
-          setMood(message.mood);
-          break;
-        case "error":
-          console.error("[ai] worker error:", message.message);
-          break;
+    const service = createTauriAudioMoodService({ modelBaseUrl: MODEL_BASE_URL });
+    serviceRef.current = service;
+
+    const unsubscribeResult = service.subscribe((result) => {
+      lastMoodAtRef.current = performance.now();
+      setStale(false);
+      setMood({
+        ...result.scores,
+        streamEpoch: result.streamEpoch,
+        sequence: result.sequence,
+        confidence: result.confidence,
+        inferenceMs: result.inferenceMs,
+        modelReady: result.modelReady,
+      });
+    });
+    const unsubscribeStatus = service.subscribeStatus(setStatus);
+    let syncing = false;
+    const syncWithAudioMonitor = async () => {
+      if (syncing || !isTauri()) return;
+      syncing = true;
+      try {
+        const audioStatus = await invoke<AudioMonitorStatus>("audio_monitor_status");
+        const phase = service.getStatus().phase;
+        if (audioStatus.running && (phase === "idle" || phase === "failed")) {
+          await service.start();
+        } else if (!audioStatus.running && phase !== "idle") {
+          await service.stop();
+        }
+      } catch {
+        // Service status reports connection failures; polling retries when audio becomes available.
+      } finally {
+        syncing = false;
       }
     };
-    worker.postMessage({ type: "ping" } satisfies MainToWorker);
+    void syncWithAudioMonitor();
+    const backendTimer = window.setInterval(() => void syncWithAudioMonitor(), BACKEND_CHECK_MS);
+
     return () => {
-      worker.terminate();
-      workerRef.current = null;
+      window.clearInterval(backendTimer);
+      unsubscribeResult();
+      unsubscribeStatus();
+      serviceRef.current = null;
+      void service.dispose();
     };
   }, []);
 
@@ -70,17 +109,20 @@ export function useAiMood(): AiMoodHandle {
     return () => window.clearInterval(timer);
   }, []);
 
-  const sendPcm = useCallback((buffer: ArrayBuffer, capturedAtUs: number) => {
-    // buffer 所有权转移给 Worker，调用方之后不得再读写
-    workerRef.current?.postMessage(
-      { type: "pcm", buffer, sampleRate: 16000, capturedAtUs } satisfies MainToWorker,
-      [buffer],
-    );
-  }, []);
-
   const selfTest = useCallback(() => {
-    workerRef.current?.postMessage({ type: "self-test" } satisfies MainToWorker);
+    const service = serviceRef.current;
+    if (!service) return;
+    void service.stop().then(() => service.start()).catch(() => undefined);
   }, []);
 
-  return { mood, moodState: resolveMoodState(mood), workerReady, stale, sendPcm, selfTest };
+  const workerReady = status.phase === "running" || status.phase === "degraded";
+  return {
+    mood,
+    moodState: resolveMoodState(mood),
+    workerReady,
+    stale,
+    status,
+    error: status.lastError,
+    selfTest,
+  };
 }
