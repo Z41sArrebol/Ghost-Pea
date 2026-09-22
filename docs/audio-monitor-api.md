@@ -102,6 +102,21 @@ export interface AiPcmStatus {
 
 `bass + mid + treble` 在非静音窗口中约等于 `1`。这些值表示频谱构成，不表示三个频段各自的绝对音量；前端应结合 `rms` 使用。所有特征当前未经设备响度标定，进入滤镜前仍需 Attack/Release、限幅和静音回落。
 
+AI PCM 状态字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `enabled` | `boolean` | 当前是否向 AI RingBuffer 复制 PCM 并发送窗口 |
+| `outputSampleRateHz` | `number` | AI PCM 输出采样率；会话存在时固定为 `16000` |
+| `windowSamples` | `number` | 每个窗口的样本数；会话存在时固定为 `48000` |
+| `hopSamples` | `number` | 相邻窗口的步长；会话存在时固定为 `16000` |
+| `streamEpoch` | `number` | 流连续性代次；启用、禁用、丢样或 Channel 失败时递增 |
+| `sequence` | `number` | 当前启用周期内生成的窗口序号；每次启用时从零重新计数 |
+| `emittedWindows` | `number` | 本次音频监听会话中成功发送的窗口累计数 |
+| `droppedInputSamples` | `number` | 采集或 AI RingBuffer 丢失的输入采样累计数 |
+| `bufferedInputSamples` | `number` | AI RingBuffer 中等待处理的设备采样率单声道样本数 |
+| `lastError` | `string \| null` | 最近一次重采样或 Channel 发送错误 |
+
 ## 3. 快速 DSP 事件
 
 ### Event
@@ -213,7 +228,7 @@ console.log("audio started", status);
 
 行为说明：
 
-- 首次调用会创建 WASAPI 采集线程和 DSP 线程，并等待设备初始化完成。
+- 首次调用会创建 WASAPI 采集线程、DSP 线程和 AI PCM 线程，并等待设备初始化完成。AI PCM 默认禁用，线程仅低频休眠，不复制 PCM 或分配 3 秒滑窗。
 - 如果监听已经运行，则不会重复创建线程，直接返回当前状态。
 - 如果上一次会话已进入 `failed`，调用本接口会先回收旧线程，再重新获取当前默认输出设备并创建新会话。
 - 启动失败时 Promise 被拒绝，错误值为后端返回的字符串。
@@ -308,7 +323,7 @@ console.log("audio stopped", finalStatus);
 
 行为说明：
 
-- 停止 WASAPI 采集线程和 DSP 线程，并等待两个线程退出。
+- 停止 WASAPI 采集线程、DSP 线程和 AI PCM 线程，并等待三个线程退出。
 - 返回停止后的最终统计，其中 `running` 为 `false`。
 - 如果监听尚未运行，返回全零默认状态。
 - 再次调用 `start_audio_monitor` 会创建新的监听会话，累计计数从零开始。
@@ -327,15 +342,25 @@ ai_pcm_status
 
 `start_ai_pcm_stream` 接收名为 `channel` 的 Tauri `Channel<ArrayBuffer>`。再次调用会替换旧 Channel，并开始一个新的 `streamEpoch`。`stop_ai_pcm_stream` 禁用 AI 数据复制、清空重采样状态并释放 Channel。`ai_pcm_status` 无参数。
 
+三个 Command 均返回 `Promise<AiPcmStatus>`。音频监听未运行时，`start_ai_pcm_stream` 会拒绝 Promise；其余两个状态接口在监听未运行时返回全零默认对象。
+
 ```ts
 import { Channel, invoke } from "@tauri-apps/api/core";
 
 const channel = new Channel<ArrayBuffer>();
 channel.onmessage = (payload) => {
+  if (payload.byteLength < 32) {
+    return;
+  }
+
   const view = new DataView(payload);
   const version = view.getUint32(0, true);
   const sampleRateHz = view.getUint32(4, true);
   const sampleCount = view.getUint32(8, true);
+  if (version !== 1 || payload.byteLength !== 32 + sampleCount * 4) {
+    return;
+  }
+
   const streamEpoch = view.getBigUint64(16, true);
   const sequence = view.getBigUint64(24, true);
   const samples = new Float32Array(payload, 32, sampleCount);
@@ -366,38 +391,22 @@ const status = await invoke<AiPcmStatus>("start_ai_pcm_stream", { channel });
 
 当采集 RingBuffer 或 AI RingBuffer 发生丢样时，Rust 会递增 `streamEpoch`，清空 AI RingBuffer，并重置重采样器和滑窗。前端不得跨 epoch 拼接或比较窗口序号。
 
-Tauri Channel 不提供模型消费确认。Channel 回调向 Web Worker 投递时，适配层必须采用单槽 latest-only 策略：模型忙时覆盖尚未开始推理的旧窗口，不建立无界队列。Channel 发送失败时 AI PCM 自动禁用，错误写入 `lastError`；快速 DSP 和 WASAPI 监听继续运行。
+Tauri Channel 不提供模型消费确认。Channel 回调向 Web Worker 投递时，适配层必须采用单槽 latest-only 策略：模型忙时覆盖尚未开始推理的旧窗口，不建立无界队列。该 latest-only 行为由前端实现，Rust 端不会等待模型推理。Channel 发送失败时 AI PCM 自动禁用，错误写入 `lastError`；快速 DSP 和 WASAPI 监听继续运行。
 
-## 8. 推荐封装
+## 9. 推荐封装
 
 ```ts
-import { invoke } from "@tauri-apps/api/core";
-
-export interface AudioStatus {
-  running: boolean;
-  state: AudioRuntimeState;
-  lastError: string | null;
-  sampleRateHz: number;
-  channels: number;
-  capturedFrames: number;
-  droppedSamples: number;
-  sequence: number;
-  capturedAtUs: number;
-  rms: number;
-  bass: number;
-  mid: number;
-  treble: number;
-  onset: number;
-  centroid: number;
-  energyTrend: number;
-  silence: boolean;
-}
+import { Channel, invoke } from "@tauri-apps/api/core";
 
 export const audioMonitorApi = {
   start: () => invoke<AudioStatus>("start_audio_monitor"),
   status: () => invoke<AudioStatus>("audio_monitor_status"),
   performance: () => invoke<DspPerformance>("audio_performance_status"),
   stop: () => invoke<AudioStatus>("stop_audio_monitor"),
+  startAiPcm: (channel: Channel<ArrayBuffer>) =>
+    invoke<AiPcmStatus>("start_ai_pcm_stream", { channel }),
+  stopAiPcm: () => invoke<AiPcmStatus>("stop_ai_pcm_stream"),
+  aiPcmStatus: () => invoke<AiPcmStatus>("ai_pcm_status"),
 };
 ```
 
@@ -412,7 +421,7 @@ try {
 }
 ```
 
-## 9. 当前边界
+## 10. 当前边界
 
 当前版本仅提供：
 
@@ -420,9 +429,13 @@ try {
 - PCM 累计帧数和丢样统计。
 - RMS、Bass、Mid、Treble、Onset、Spectral Centroid、能量趋势和静音状态。
 - 最高 60 Hz 的 `audio-features` 主动事件。
+- 约每秒一次的 `audio-performance` 性能事件和按需状态查询。
+- 16 kHz 单声道 `f32` AI PCM 二进制窗口，固定 3 秒窗口和 1 秒步长。
+- AI PCM 启停、状态查询、断流 `streamEpoch` 和 Channel 失败降级。
 
 当前尚未提供：
 
 - 音频设备选择。
 - 设备相关响度标定和自适应噪声底。
-- AI 使用的 16 kHz PCM 二进制窗口。
+- 默认输出设备变化通知和自动重连；设备失效后需要前端重新调用 `start_audio_monitor`。
+- 前端模型推理、Web Worker 队列和 latest-only 调度。

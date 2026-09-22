@@ -11,6 +11,7 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@ghost-pea/audio-ai": "workspace:*",
     "@tauri-apps/api": "^2",
     "antd": "^6.6.5",
     "react": "^19.1.0",
