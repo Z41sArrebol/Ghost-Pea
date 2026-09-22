@@ -1,14 +1,32 @@
 import { FRAGMENT_SHADER, VERTEX_SHADER } from "./shaders";
 
-export interface FilterParams {
-  rms: number;
-  bass: number;
-  treble: number;
-  onset: number;
-  centroid: number;
-  intensity: number;
-  bypass: boolean;
-}
+const FLOAT_UNIFORMS = [
+  "uTime",
+  "uRms",
+  "uBass",
+  "uTreble",
+  "uOnset",
+  "uCentroid",
+  "uIntensity",
+  "uBypass",
+  "uBaseContrast",
+  "uBrightness",
+  "uVignette",
+  "uGrainBase",
+  "uHighlightThr",
+  "uShadowCool",
+  "uMapRmsGlow",
+  "uMapBassWarm",
+  "uMapTrebleGrain",
+  "uMapOnsetContrast",
+  "uMapCentroidTemp",
+] as const;
+
+export type UniformName = (typeof FLOAT_UNIFORMS)[number];
+
+export type UniformValues = Record<UniformName, number>;
+
+export type FitMode = "cover" | "contain";
 
 function compileShader(gl: WebGL2RenderingContext, type: number, source: string): WebGLShader {
   const shader = gl.createShader(type);
@@ -25,7 +43,9 @@ export class FilterRenderer {
   private readonly canvas: HTMLCanvasElement;
   private readonly gl: WebGL2RenderingContext;
   private readonly texture: WebGLTexture;
-  private readonly uniformLocations: Record<string, WebGLUniformLocation | null>;
+  private readonly uniformLocations: Record<UniformName, WebGLUniformLocation | null>;
+  private readonly uvScaleXLocation: WebGLUniformLocation | null;
+  private readonly uvScaleYLocation: WebGLUniformLocation | null;
 
   constructor(canvas: HTMLCanvasElement) {
     const gl = canvas.getContext("webgl2", { antialias: false });
@@ -54,43 +74,60 @@ export class FilterRenderer {
     // 视频解码出来的帧是倒置的，上传时翻转回来
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
 
-    this.uniformLocations = {
-      uTexture: gl.getUniformLocation(program, "uTexture"),
-      uTime: gl.getUniformLocation(program, "uTime"),
-      uRms: gl.getUniformLocation(program, "uRms"),
-      uBass: gl.getUniformLocation(program, "uBass"),
-      uTreble: gl.getUniformLocation(program, "uTreble"),
-      uOnset: gl.getUniformLocation(program, "uOnset"),
-      uCentroid: gl.getUniformLocation(program, "uCentroid"),
-      uIntensity: gl.getUniformLocation(program, "uIntensity"),
-      uBypass: gl.getUniformLocation(program, "uBypass"),
-    };
-    gl.uniform1i(this.uniformLocations.uTexture, 0);
+    this.uniformLocations = Object.fromEntries(
+      FLOAT_UNIFORMS.map((name) => [name, gl.getUniformLocation(program, name)]),
+    ) as Record<UniformName, WebGLUniformLocation | null>;
+    this.uvScaleXLocation = gl.getUniformLocation(program, "uUvScaleX");
+    this.uvScaleYLocation = gl.getUniformLocation(program, "uUvScaleY");
+    gl.uniform1i(gl.getUniformLocation(program, "uTexture"), 0);
   }
 
-  render(video: HTMLVideoElement, timeSeconds: number, params: FilterParams): void {
+  render(video: HTMLVideoElement, values: UniformValues, fit: FitMode): void {
     const { gl } = this;
     if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-      this.resizeToVideo(video);
+      this.resize(video, fit);
       gl.bindTexture(gl.TEXTURE_2D, this.texture);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
     }
-    gl.uniform1f(this.uniformLocations.uTime, timeSeconds);
-    gl.uniform1f(this.uniformLocations.uRms, params.rms);
-    gl.uniform1f(this.uniformLocations.uBass, params.bass);
-    gl.uniform1f(this.uniformLocations.uTreble, params.treble);
-    gl.uniform1f(this.uniformLocations.uOnset, params.onset);
-    gl.uniform1f(this.uniformLocations.uCentroid, params.centroid);
-    gl.uniform1f(this.uniformLocations.uIntensity, params.intensity);
-    gl.uniform1f(this.uniformLocations.uBypass, params.bypass ? 1 : 0);
+    let uvScaleX = 1;
+    let uvScaleY = 1;
+    if (fit === "cover" && video.videoWidth && video.videoHeight && this.canvas.width && this.canvas.height) {
+      const canvasAspect = this.canvas.width / this.canvas.height;
+      const videoAspect = video.videoWidth / video.videoHeight;
+      if (canvasAspect > videoAspect) {
+        uvScaleY = videoAspect / canvasAspect;
+      } else {
+        uvScaleX = canvasAspect / videoAspect;
+      }
+    }
+    for (const name of FLOAT_UNIFORMS) {
+      gl.uniform1f(this.uniformLocations[name], values[name]);
+    }
+    gl.uniform1f(this.uvScaleXLocation, uvScaleX);
+    gl.uniform1f(this.uvScaleYLocation, uvScaleY);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 
-  private resizeToVideo(video: HTMLVideoElement): void {
+  private resize(video: HTMLVideoElement, fit: FitMode): void {
+    if (fit === "cover") {
+      // cover 模式画布跟随显示区域尺寸，由 CSS 撑满 stage
+      const cssWidth = this.canvas.clientWidth;
+      const cssHeight = this.canvas.clientHeight;
+      if (!cssWidth || !cssHeight) return;
+      const scale = Math.min(1, 1920 / cssWidth);
+      const targetWidth = Math.round(cssWidth * scale);
+      const targetHeight = Math.round(cssHeight * scale);
+      if (this.canvas.width !== targetWidth || this.canvas.height !== targetHeight) {
+        this.canvas.width = targetWidth;
+        this.canvas.height = targetHeight;
+        this.gl.viewport(0, 0, targetWidth, targetHeight);
+      }
+      return;
+    }
     const width = video.videoWidth;
     const height = video.videoHeight;
     if (!width || !height) return;
-    const scale = Math.min(1, 1280 / width);
+    const scale = Math.min(1, 1920 / width);
     const targetWidth = Math.round(width * scale);
     const targetHeight = Math.round(height * scale);
     if (this.canvas.width !== targetWidth || this.canvas.height !== targetHeight) {
