@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AudioFeatures } from "../audio/useAudioFeatures";
-import { ParameterOrchestrator, smoothToward, type RenderParameters } from "./orchestrator";
+import { ParameterOrchestrator, rmsToVisualLevel, smoothToward, type RenderParameters } from "./orchestrator";
 import { THEME_PRESETS } from "./presets";
 import { DEFAULT_PARAMS, PARAM_DEFS, parseParams, type ParamValues } from "./schema";
 
@@ -165,6 +165,31 @@ describe("smoothToward", () => {
   });
 });
 
+describe("rmsToVisualLevel", () => {
+  it.each([-1, 0, 0.0005, 0.001, NaN, Infinity, -Infinity])("keeps silence or invalid RMS %s at zero", (rms) => {
+    expect(rmsToVisualLevel(rms)).toBe(0);
+  });
+
+  it.each([
+    [0.02, 0.4336766652, 3],
+    [0.2, 0.7670099986, 6],
+    [1, 1, 8],
+    [2, 1, 8],
+  ])("maps RMS %s to level %s and %s of eight meter rows", (rms, level, rows) => {
+    expect(rmsToVisualLevel(rms)).toBeCloseTo(level, 8);
+    expect(Math.round(rmsToVisualLevel(rms) * 8)).toBe(rows);
+  });
+
+  it("rises continuously from the silence floor without flattening normal music", () => {
+    const levels = [0.001, 0.001001, 0.01, 0.015, 0.02, 0.03, 0.1, 0.2, 0.5, 1].map(rmsToVisualLevel);
+    expect(levels[1]).toBeLessThan(0.001);
+    for (let i = 1; i < levels.length; i++) {
+      expect(levels[i]).toBeGreaterThan(levels[i - 1]);
+      expect(levels[i]).toBeLessThanOrEqual(1);
+    }
+  });
+});
+
 describe("ParameterOrchestrator", () => {
   it("starts from the selected static grade with neutral dynamics and intentional grain", () => {
     const initial = parseParams(THEME_PRESETS[1].values, DEFAULT_PARAMS);
@@ -252,6 +277,74 @@ describe("ParameterOrchestrator", () => {
     expect(result.bloomWarm).toBe(0);
     expect(result.grain).toBe(target.grainBase);
     expect(result.temperature).toBe(0);
+  });
+
+  it.each([0.02, 0.2])("boosts visual response at RMS %s while preserving the measured value", (rms) => {
+    const orchestrator = new ParameterOrchestrator(DEFAULT_PARAMS);
+    const audio = { ...LOUD, rms, bass: 0.5, mid: 0.3, treble: 0.2, onset: 0, centroid: 0.5 };
+    const result = advance(orchestrator, DEFAULT_PARAMS, audio);
+    const energy = rmsToVisualLevel(rms) * DEFAULT_PARAMS.intensity;
+    expect(orchestrator.features.rms).toBeCloseTo(rms, 8);
+    expect(audio.rms).toBe(rms);
+    expect(result.bloom).toBeCloseTo(energy * DEFAULT_PARAMS.mapRmsGlow, 6);
+    expect(result.bloomWarm).toBeCloseTo(0.5 * energy * DEFAULT_PARAMS.mapBassWarm, 6);
+    expect(result.grain).toBeCloseTo(DEFAULT_PARAMS.grainBase + 0.2 * energy * DEFAULT_PARAMS.mapTrebleGrain, 6);
+    expect(result.contrast).toBe(DEFAULT_PARAMS.baseContrast);
+    expectBounded(result);
+  });
+
+  it.each([0, 1])("keeps sub-threshold noise from driving effects with silenceFallback=%s", (silenceFallback) => {
+    const target = params({ silenceFallback });
+    const orchestrator = new ParameterOrchestrator(target);
+    const result = advance(orchestrator, target, { ...LOUD, rms: 0.0009, onset: 0 });
+    expect(result.bloom).toBe(0);
+    expect(result.bloomWarm).toBe(0);
+    expect(result.grain).toBe(target.grainBase);
+    expect(rmsToVisualLevel(orchestrator.features.rms)).toBe(0);
+  });
+
+  it.each([true, false])("smoothly releases low-volume dynamics after silence (available=%s)", (available) => {
+    const orchestrator = new ParameterOrchestrator(DEFAULT_PARAMS);
+    const audio = { ...LOUD, rms: 0.02 };
+    let previous = { ...advance(orchestrator, DEFAULT_PARAMS, audio) };
+    expect(previous.bloom).toBeGreaterThan(0.2);
+    for (let i = 0; i < 180; i++) {
+      const result = orchestrator.update(DEFAULT_PARAMS, available ? SILENT : audio, available, 1 / 60);
+      expectBounded(result);
+      expectRate(previous, result, 1 / 60);
+      expect(result.bloom).toBeLessThanOrEqual(previous.bloom);
+      previous = { ...result };
+    }
+    expect(previous.bloom).toBe(0);
+    expect(previous.bloomWarm).toBe(0);
+    expect(previous.grain).toBe(DEFAULT_PARAMS.grainBase);
+    expect(rmsToVisualLevel(orchestrator.features.rms)).toBe(0);
+  });
+
+  it("preserves the intensity and bloom switches at low volume", () => {
+    const audio = { ...LOUD, rms: 0.02 };
+    const disabled = params({ bloomEnabled: 0 });
+    const withoutBloom = advance(new ParameterOrchestrator(disabled), disabled, audio);
+    expect(withoutBloom.bloom).toBe(0);
+    expect(withoutBloom.bloomWarm).toBe(0);
+    const zero = params({ intensity: 0 });
+    const withoutDynamics = advance(new ParameterOrchestrator(zero), zero, audio);
+    expect(withoutDynamics.bloom).toBe(0);
+    expect(withoutDynamics.bloomWarm).toBe(0);
+    expect(withoutDynamics.grain).toBe(zero.grainBase);
+  });
+
+  it("keeps boosted low-to-high volume transitions within existing rate limits", () => {
+    const orchestrator = new ParameterOrchestrator(DEFAULT_PARAMS);
+    let previous = { ...orchestrator.update(DEFAULT_PARAMS, SILENT, false, 0) };
+    for (const rms of [0.02, 0.2, 0.01, 1, 0]) {
+      for (let i = 0; i < 60; i++) {
+        const result = orchestrator.update(DEFAULT_PARAMS, { ...LOUD, rms }, true, 1 / 60);
+        expectBounded(result);
+        expectRate(previous, result, 1 / 60);
+        previous = { ...result };
+      }
+    }
   });
 
   it("bounds final compositions and per-second deltas across extreme retargets", () => {
