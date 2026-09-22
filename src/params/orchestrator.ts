@@ -19,6 +19,7 @@ export interface RenderParameters {
 }
 
 const BASE_TAU = 0.2;
+const RMS_SILENCE_THRESHOLD = 0.001;
 const FEATURE_KEYS = ["rms", "bass", "treble", "onset", "centroid"] as const;
 const LOOK_KEYS = ["lookDark", "lookCalm", "lookBright"] as const;
 const OUTPUT_LIMITS: Record<keyof RenderParameters, [number, number, number?]> = {
@@ -47,6 +48,12 @@ function frameDelta(dt: number): number {
 
 function featureValue(value: number, neutral: number): number {
   return Number.isFinite(value) ? clamp(value, 0, 1) : neutral;
+}
+
+export function rmsToVisualLevel(rms: number): number {
+  // 对数映射让低音量可见，静音阈值以下仍为零，避免抬高底噪。
+  const amplitude = Math.max(RMS_SILENCE_THRESHOLD, featureValue(rms, 0));
+  return Math.log10(amplitude / RMS_SILENCE_THRESHOLD) / Math.log10(1 / RMS_SILENCE_THRESHOLD);
 }
 
 function normalizeLooks(params: ParamValues): void {
@@ -102,7 +109,7 @@ export class ParameterOrchestrator {
     }
 
     const p = this.params;
-    const silent = features.silence || featureValue(features.rms, 0) <= 0.001;
+    const silent = features.silence || featureValue(features.rms, 0) <= RMS_SILENCE_THRESHOLD;
     const fallback = !available || (silent && p.silenceFallback === 1);
     const present = available && !silent;
     for (const key of FEATURE_KEYS) {
@@ -132,7 +139,7 @@ export class ParameterOrchestrator {
   private compose(): RenderParameters {
     const p = this.params;
     const f = this.features;
-    const energy = f.rms * p.intensity;
+    const energy = rmsToVisualLevel(f.rms) * p.intensity;
     return {
       contrast: p.baseContrast + f.onset * p.mapOnsetContrast * p.intensity,
       brightness: p.brightness,

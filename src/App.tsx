@@ -53,6 +53,7 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
   const [activeFn, setActiveFn] = useState<FunctionKey>("filter");
   const [frameStats, setFrameStats] = useState({ render: 0, video: 0, p95: 0 });
   const [meter, setMeter] = useState({ rms: 0, bass: 0, treble: 0, onset: 0, centroid: 0.5 });
+  const [valenceSensitivity, setValenceSensitivity] = useState(24);
 
   const { featuresRef, lastReceivedAtRef, running, source, status, busy: audioBusy, error: audioError, stale: audioStale, start, stop } = useAudioFeatures();
   const {
