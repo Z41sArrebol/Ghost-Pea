@@ -53,7 +53,7 @@ const STATUS_POLL_MS = 1000;
 const SIM_INTERVAL_MS = 33;
 
 export interface AudioFeaturesHandle {
-  featuresRef: React.RefObject<AudioFeatures>;
+  featuresRef: React.MutableRefObject<AudioFeatures>;
   running: boolean;
   source: AudioSource;
   status: AudioStatus | null;
