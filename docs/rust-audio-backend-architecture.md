@@ -11,7 +11,7 @@
 - 音频采集回调不执行阻塞操作或高开销计算。
 - 快速 DSP 不受 AI 推理和大块 IPC 传输影响。
 - 所有跨线程队列有界，消费者落后时不形成无限内存增长。
-- P0 不为未启用的 AI 链路创建线程或分配大窗口。
+- AI 禁用时不复制 PCM，也不分配 3 秒窗口；常驻 AI 线程只休眠并清空缓冲。
 - P2 可以在不改变采集和快速 DSP 接口的情况下启用 AI PCM 链路。
 - Release 构建中，快速 DSP 周期耗时目标为 P95 小于 3 ms、P99 小于 5 ms。
 
@@ -32,7 +32,7 @@ WASAPI Loopback 回调
 
 这里的两个执行上下文仅指 Rust 音频链，不包含 Tauri 自身的运行时线程和前端线程。
 
-### 3.2 P2：按需启用第三个线程
+### 3.2 P2：第三个专用线程
 
 ```text
 WASAPI Loopback 回调
@@ -43,14 +43,14 @@ WASAPI Loopback 回调
           └─ 非阻塞复制 → AI SPSC 环形缓冲
                                 ↓
                          AI PCM 生产线程
-                         ├─ 48 kHz → 16 kHz 重采样
-                         ├─ 维护 2–5 秒滑动窗口
-                         └─ 0.5–2 Hz 二进制 Channel
+                         ├─ 44.1/48 kHz → 16 kHz 重采样
+                         ├─ 维护 3 秒滑动窗口
+                         └─ 1 Hz 二进制 Channel
 ```
 
-AI PCM 生产线程只在用户启用 AI 时启动。它不执行模型推理；模型推理属于前端 Web Worker。
+AI PCM 生产线程随音频会话启动，AI 禁用时不消费或分配滑窗，只进行低频休眠。它不执行模型推理；模型推理属于前端 Web Worker。
 
-快速 DSP 向 AI 缓冲写入时不得等待。AI 消费者落后时丢弃旧数据，使后续分析尽快追上实时位置。发生数据不连续后，AI 线程必须重置重采样器和滑动窗口，避免把时间上不连续的样本拼接成一个有效窗口。
+快速 DSP 向 AI 缓冲写入时不得等待。AI 缓冲空间不足时丢弃当前 DSP 块并递增 `streamEpoch`。AI 线程观察到 epoch 变化后清空积压、重置重采样器和滑动窗口，避免把时间上不连续的样本拼接成一个有效窗口。
 
 ## 4. 线程职责
 
@@ -91,11 +91,11 @@ P2 启用后，DSP 线程将刚消费的 PCM 非阻塞地复制到 AI 专用缓�
 
 1. 消费 AI 专用 PCM 缓冲。
 2. 重采样为 16 kHz 单声道 `f32`。
-3. 维护最近 2 至 5 秒的滑动窗口。
-4. 每 0.5 至 2 秒发布最新完整窗口。
-5. 统计窗口丢弃、重采样重置和发送耗时。
+3. 维护固定 3 秒、1 秒步长的滑动窗口。
+4. 通过二进制 Tauri Channel 发布完整窗口。
+5. 统计发送窗口、输入丢样、缓冲深度和 `streamEpoch`。
 
-AI PCM 使用二进制 Channel 传输，不使用 JSON 数组。发送失败或前端消费过慢时只保留最新窗口。
+AI PCM 使用二进制 Channel 传输，不使用 JSON 数组。发送失败时禁用 AI PCM，但不停止快速 DSP。前端 Channel 到 Web Worker 的适配层负责只保留最新待推理窗口。
 
 ## 5. 初步类型设计
 
@@ -119,11 +119,17 @@ pub struct AudioFeatures {
     pub silence: bool,
 }
 
-pub struct AiPcmWindow {
+pub struct AiPcmStatus {
+    pub enabled: bool,
+    pub output_sample_rate_hz: u32,
+    pub window_samples: u32,
+    pub hop_samples: u32,
+    pub stream_epoch: u64,
     pub sequence: u64,
-    pub captured_at_us: u64,
-    pub sample_rate_hz: u32,
-    pub samples: Box<[f32]>,
+    pub emitted_windows: u64,
+    pub dropped_input_samples: u64,
+    pub buffered_input_samples: u64,
+    pub last_error: Option<String>,
 }
 
 pub struct AudioRuntimeStats {
@@ -148,9 +154,9 @@ pub struct AudioRuntimeStats {
 
 | 队列 | 生产者 | 消费者 | 满载策略 |
 | --- | --- | --- | --- |
-| 采集 PCM 缓冲 | WASAPI 回调 | DSP 线程 | 不阻塞回调，丢弃最旧样本并计数 |
-| AI PCM 缓冲 | DSP 线程 | AI PCM 生产线程 | 不阻塞 DSP，丢弃最旧样本并标记时间不连续 |
-| AI 窗口发送槽 | AI PCM 生产线程 | 前端 Web Worker | 只保留最新完整窗口 |
+| 采集 PCM 缓冲 | WASAPI 回调 | DSP 线程 | 不阻塞回调，丢弃当前无法写入的样本并计数 |
+| AI PCM 缓冲 | DSP 线程 | AI PCM 生产线程 | 不阻塞 DSP，整块丢弃当前输入并推进 epoch |
+| AI Channel 接收槽 | Tauri Channel 回调 | 前端 Web Worker | 前端只保留最新待推理窗口 |
 
 缓冲容量以时间而不是固定样本数配置，并根据设备采样率换算。初始建议：
 
@@ -173,12 +179,14 @@ Stopped → Starting → Running → Stopping → Stopped
 2. 分配所有实时缓冲和 DSP 工作区。
 3. 启动 DSP 线程。
 4. 启动 WASAPI Loopback。
-5. P2 启用时启动 AI PCM 生产线程。
+5. 启动 AI PCM 生产线程；禁用状态下线程休眠且 DSP 不复制数据。
 6. 发布 `Running` 状态。
 
 停止顺序与启动顺序相反。停止信号使用原子状态或非阻塞控制通道；退出时可以在非实时控制路径等待线程 `join`。
 
 设备断开或采集失败时停止产生正常特征快照，发布明确错误状态，并清空旧 PCM，避免重连后消费过期数据。
+
+P0 采用可靠失败和手动重启策略：运行期 WASAPI 读取错误或健康检查失败时，共享状态切换为 `Failed`，记录 `last_error` 并停止 DSP。下一次启动请求先回收失败会话的线程和缓冲，再基于当前默认输出设备创建全新会话。默认设备变化的主动通知和自动重连留到 P1。
 
 ## 8. 性能预算与验收
 
@@ -200,14 +208,23 @@ Stopped → Starting → Running → Stopping → Stopped
 - DSP 周期耗时 P95 小于 3 ms、P99 小于 5 ms。
 - 正常负载下采集缓冲无溢出。
 - 人工延迟 AI 消费者时，快速 DSP 的 P99 不明显上升。
-- AI 禁用时不创建 AI 线程，不分配 2 至 5 秒窗口。
+- AI 禁用时不复制 PCM、不运行重采样，也不分配 3 秒窗口。
 - 音频设备断开后不再发送伪正常快照。
+
+### 8.1 DSP 性能观测
+
+DSP 在每次快速特征分析前后读取单调时钟，将耗时写入固定容量的 512 项窗口。热路径不加锁、不输出日志，也不分配统计缓冲。每秒在 DSP 线程中生成一次 P50、P95、P99 和最大值快照。
+
+性能接口同时报告采集 RingBuffer 剩余 PCM 对应的 `pipeline_lag_us`。该值用于区分算法计算变慢与线程调度、IPC 或系统负载导致的消费积压。
+
+性能快照通过 `audio-performance` Tauri Event 约每秒发送一次，并可通过 `audio_performance_status` Command 按需查询。性能数据不混入高频 `audio-features` 事件。
 
 ## 9. 实施顺序
 
 1. 定义音频配置、特征快照、运行状态和统计类型。
 2. 完成 WASAPI Loopback 到采集 PCM 缓冲。
 3. 完成 DSP 线程及固定输入回放测试。
-4. 接入 Tauri 特征事件并测量 P50、P95、P99。
-5. 为 P2 增加 AI PCM 缓冲和按需线程。
-6. 验证二进制 Channel、消费者延迟和窗口丢弃策略。
+4. 接入 Tauri 特征事件及 DSP 性能 P50、P95、P99 测量。
+5. 为 P2 增加 AI PCM 缓冲和独立线程。
+6. 接入二进制 Channel、断流 epoch 和窗口测试。
+7. 在前端 Web Worker 适配层验证消费者延迟和 latest-only 策略。

@@ -1,3 +1,6 @@
+mod ai_pcm;
+mod metrics;
+
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -12,19 +15,52 @@ use ringbuf::{traits::*, HeapRb};
 use serde::Serialize;
 use wasapi::{initialize_mta, DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat};
 
+use ai_pcm::SharedAiPcm;
+pub use ai_pcm::{AiPcmStatus, WindowSink};
+pub use metrics::DspPerformance;
+use metrics::{DspMetrics, SharedDspPerformance};
+
 const CAPTURE_BUFFER_MILLIS: usize = 250;
+const MAX_AI_INPUT_SAMPLE_RATE_HZ: usize = 192_000;
 const EVENT_WAIT_MILLIS: u32 = 50;
+const HEALTH_CHECK_TIMEOUTS: u32 = 20;
 const FFT_SIZE: usize = 2048;
 const DSP_HOP_SIZE: usize = 512;
 const FEATURE_EVENT_INTERVAL: Duration = Duration::from_micros(16_667);
 const SILENCE_RMS: f32 = 0.001;
 
 pub type FeatureSink = Arc<dyn Fn(AudioFeatures) + Send + Sync + 'static>;
+pub type PerformanceSink = Arc<dyn Fn(DspPerformance) + Send + Sync + 'static>;
 
-#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AudioRuntimeState {
+    #[default]
+    Stopped,
+    Starting,
+    Running,
+    Stopping,
+    Failed,
+}
+
+impl AudioRuntimeState {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Starting,
+            2 => Self::Running,
+            3 => Self::Stopping,
+            4 => Self::Failed,
+            _ => Self::Stopped,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioStatus {
     pub running: bool,
+    pub state: AudioRuntimeState,
+    pub last_error: Option<String>,
     pub sample_rate_hz: u32,
     pub channels: u16,
     pub captured_frames: u64,
@@ -39,6 +75,43 @@ pub struct AudioStatus {
     pub centroid: f32,
     pub energy_trend: f32,
     pub silence: bool,
+}
+
+struct SharedRuntime {
+    state: AtomicU32,
+    last_error: Mutex<Option<String>>,
+}
+
+impl SharedRuntime {
+    fn new() -> Self {
+        Self {
+            state: AtomicU32::new(AudioRuntimeState::Starting as u32),
+            last_error: Mutex::new(None),
+        }
+    }
+
+    fn state(&self) -> AudioRuntimeState {
+        AudioRuntimeState::from_u8(self.state.load(Ordering::Acquire) as u8)
+    }
+
+    fn set_state(&self, state: AudioRuntimeState) {
+        self.state.store(state as u32, Ordering::Release);
+    }
+
+    fn fail(&self, error: String) {
+        *self
+            .last_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
+        self.set_state(AudioRuntimeState::Failed);
+    }
+
+    fn last_error(&self) -> Option<String> {
+        self.last_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
 }
 
 #[derive(Default)]
@@ -60,9 +133,12 @@ struct SharedStats {
 }
 
 impl SharedStats {
-    fn snapshot(&self, running: bool) -> AudioStatus {
+    fn snapshot(&self, runtime: &SharedRuntime) -> AudioStatus {
+        let state = runtime.state();
         AudioStatus {
-            running,
+            running: state == AudioRuntimeState::Running,
+            state,
+            last_error: runtime.last_error(),
             sample_rate_hz: self.sample_rate_hz.load(Ordering::Relaxed) as u32,
             channels: self.channels.load(Ordering::Relaxed) as u16,
             captured_frames: self.captured_frames.load(Ordering::Relaxed),
@@ -121,7 +197,11 @@ struct RunningAudio {
     stop: Arc<AtomicBool>,
     capture_thread: JoinHandle<()>,
     dsp_thread: JoinHandle<()>,
+    ai_pcm_thread: JoinHandle<()>,
     stats: Arc<SharedStats>,
+    performance: Arc<SharedDspPerformance>,
+    runtime: Arc<SharedRuntime>,
+    ai_pcm: Arc<SharedAiPcm>,
 }
 
 #[derive(Default)]
@@ -130,33 +210,106 @@ pub struct AudioMonitor {
 }
 
 impl AudioMonitor {
-    pub fn start(&self, feature_sink: FeatureSink) -> Result<AudioStatus, String> {
+    pub fn start(
+        &self,
+        feature_sink: FeatureSink,
+        performance_sink: PerformanceSink,
+    ) -> Result<AudioStatus, String> {
         let mut running = self.running.lock().map_err(|_| "audio state poisoned")?;
         if let Some(active) = running.as_ref() {
-            return Ok(active.stats.snapshot(true));
+            match active.runtime.state() {
+                AudioRuntimeState::Starting | AudioRuntimeState::Running => {
+                    return Ok(active.stats.snapshot(&active.runtime));
+                }
+                AudioRuntimeState::Stopping => {
+                    return Err("audio monitor is stopping".into());
+                }
+                AudioRuntimeState::Stopped | AudioRuntimeState::Failed => {}
+            }
+        }
+
+        if let Some(stale) = running.take() {
+            stale.stop.store(true, Ordering::Release);
+            stale
+                .capture_thread
+                .join()
+                .map_err(|_| "previous WASAPI thread panicked")?;
+            stale
+                .dsp_thread
+                .join()
+                .map_err(|_| "previous DSP thread panicked")?;
+            stale
+                .ai_pcm_thread
+                .join()
+                .map_err(|_| "previous AI PCM thread panicked")?;
         }
 
         let stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(SharedStats::default());
+        let performance = Arc::new(SharedDspPerformance::default());
+        let runtime = Arc::new(SharedRuntime::new());
         let capacity = 48_000 * CAPTURE_BUFFER_MILLIS / 1_000;
         let ring = HeapRb::<f32>::new(capacity);
         let (producer, consumer) = ring.split();
+        let ai_ring =
+            HeapRb::<f32>::new(MAX_AI_INPUT_SAMPLE_RATE_HZ * ai_pcm::RING_BUFFER_MILLIS / 1_000);
+        let (ai_producer, ai_consumer) = ai_ring.split();
+        let ai_pcm = Arc::new(SharedAiPcm::default());
+
+        let ai_stop = Arc::clone(&stop);
+        let ai_stats = Arc::clone(&stats);
+        let ai_shared = Arc::clone(&ai_pcm);
+        let ai_pcm_thread = thread::Builder::new()
+            .name("ghost-pea-ai-pcm".into())
+            .spawn(move || ai_pcm::run(ai_consumer, ai_stop, ai_stats, ai_shared))
+            .map_err(|error| format!("failed to spawn AI PCM thread: {error}"))?;
 
         let dsp_stop = Arc::clone(&stop);
         let dsp_stats = Arc::clone(&stats);
-        let dsp_thread = thread::Builder::new()
-            .name("ghost-pea-dsp".into())
-            .spawn(move || run_dsp(consumer, dsp_stop, dsp_stats, feature_sink))
-            .map_err(|error| format!("failed to spawn DSP thread: {error}"))?;
+        let dsp_performance = Arc::clone(&performance);
+        let dsp_runtime = Arc::clone(&runtime);
+        let dsp_ai_pcm = Arc::clone(&ai_pcm);
+        let dsp_thread =
+            match thread::Builder::new()
+                .name("ghost-pea-dsp".into())
+                .spawn(move || {
+                    run_dsp(
+                        consumer,
+                        dsp_stop,
+                        dsp_stats,
+                        dsp_performance,
+                        dsp_runtime,
+                        feature_sink,
+                        performance_sink,
+                        ai_producer,
+                        dsp_ai_pcm,
+                    )
+                }) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    stop.store(true, Ordering::Release);
+                    let _ = ai_pcm_thread.join();
+                    return Err(format!("failed to spawn DSP thread: {error}"));
+                }
+            };
 
         let capture_stop = Arc::clone(&stop);
         let capture_stats = Arc::clone(&stats);
+        let capture_runtime = Arc::clone(&runtime);
         let (startup_tx, startup_rx) = mpsc::sync_channel(1);
         let capture_thread = match thread::Builder::new()
             .name("ghost-pea-wasapi".into())
             .spawn(move || {
-                if let Err(error) = run_capture(producer, &capture_stop, &capture_stats, startup_tx)
-                {
+                if let Err(error) = run_capture(
+                    producer,
+                    &capture_stop,
+                    &capture_stats,
+                    &capture_runtime,
+                    startup_tx,
+                ) {
+                    if !capture_stop.load(Ordering::Acquire) {
+                        capture_runtime.fail(error.clone());
+                    }
                     capture_stop.store(true, Ordering::Release);
                     eprintln!("WASAPI capture stopped: {error}");
                 }
@@ -165,13 +318,14 @@ impl AudioMonitor {
             Err(error) => {
                 stop.store(true, Ordering::Release);
                 let _ = dsp_thread.join();
+                let _ = ai_pcm_thread.join();
                 return Err(format!("failed to spawn WASAPI thread: {error}"));
             }
         };
 
         match startup_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(())) => {
-                let status = stats.snapshot(true);
+                let status = stats.snapshot(&runtime);
                 eprintln!(
                     "[audio] monitor started: {} Hz, {} channels",
                     status.sample_rate_hz, status.channels
@@ -180,20 +334,28 @@ impl AudioMonitor {
                     stop,
                     capture_thread,
                     dsp_thread,
+                    ai_pcm_thread,
                     stats,
+                    performance,
+                    runtime,
+                    ai_pcm,
                 });
                 Ok(status)
             }
             Ok(Err(error)) => {
+                runtime.fail(error.clone());
                 stop.store(true, Ordering::Release);
                 let _ = capture_thread.join();
                 let _ = dsp_thread.join();
+                let _ = ai_pcm_thread.join();
                 Err(error)
             }
             Err(error) => {
+                runtime.fail(format!("WASAPI startup timed out: {error}"));
                 stop.store(true, Ordering::Release);
                 let _ = capture_thread.join();
                 let _ = dsp_thread.join();
+                let _ = ai_pcm_thread.join();
                 Err(format!("WASAPI startup timed out: {error}"))
             }
         }
@@ -210,6 +372,7 @@ impl AudioMonitor {
             return Ok(AudioStatus::default());
         };
 
+        active.runtime.set_state(AudioRuntimeState::Stopping);
         active.stop.store(true, Ordering::Release);
         active
             .capture_thread
@@ -219,7 +382,12 @@ impl AudioMonitor {
             .dsp_thread
             .join()
             .map_err(|_| "DSP thread panicked")?;
-        let status = active.stats.snapshot(false);
+        active
+            .ai_pcm_thread
+            .join()
+            .map_err(|_| "AI PCM thread panicked")?;
+        active.runtime.set_state(AudioRuntimeState::Stopped);
+        let status = active.stats.snapshot(&active.runtime);
         eprintln!(
             "[audio] monitor stopped: captured_frames={}, dropped_samples={}",
             status.captured_frames, status.dropped_samples
@@ -230,8 +398,41 @@ impl AudioMonitor {
     pub fn status(&self) -> Result<AudioStatus, String> {
         let running = self.running.lock().map_err(|_| "audio state poisoned")?;
         Ok(match running.as_ref() {
-            Some(active) => active.stats.snapshot(true),
+            Some(active) => active.stats.snapshot(&active.runtime),
             None => AudioStatus::default(),
+        })
+    }
+
+    pub fn performance_status(&self) -> Result<DspPerformance, String> {
+        let running = self.running.lock().map_err(|_| "audio state poisoned")?;
+        Ok(match running.as_ref() {
+            Some(active) => active.performance.snapshot(),
+            None => DspPerformance::default(),
+        })
+    }
+
+    pub fn start_ai_pcm(&self, sink: WindowSink) -> Result<AiPcmStatus, String> {
+        let running = self.running.lock().map_err(|_| "audio state poisoned")?;
+        let active = running
+            .as_ref()
+            .filter(|active| active.runtime.state() == AudioRuntimeState::Running)
+            .ok_or("audio monitor is not running")?;
+        Ok(active.ai_pcm.enable(sink))
+    }
+
+    pub fn stop_ai_pcm(&self) -> Result<AiPcmStatus, String> {
+        let running = self.running.lock().map_err(|_| "audio state poisoned")?;
+        Ok(match running.as_ref() {
+            Some(active) => active.ai_pcm.disable(),
+            None => AiPcmStatus::default(),
+        })
+    }
+
+    pub fn ai_pcm_status(&self) -> Result<AiPcmStatus, String> {
+        let running = self.running.lock().map_err(|_| "audio state poisoned")?;
+        Ok(match running.as_ref() {
+            Some(active) => active.ai_pcm.status(),
+            None => AiPcmStatus::default(),
         })
     }
 }
@@ -243,9 +444,10 @@ fn run_capture(
     mut producer: CaptureProducer,
     stop: &AtomicBool,
     stats: &SharedStats,
+    runtime: &SharedRuntime,
     startup: mpsc::SyncSender<Result<(), String>>,
 ) -> Result<(), String> {
-    let result = run_capture_inner(&mut producer, stop, stats, &startup);
+    let result = run_capture_inner(&mut producer, stop, stats, runtime, &startup);
     if let Err(error) = &result {
         let _ = startup.send(Err(error.clone()));
     }
@@ -256,6 +458,7 @@ fn run_capture_inner(
     producer: &mut CaptureProducer,
     stop: &AtomicBool,
     stats: &SharedStats,
+    runtime: &SharedRuntime,
     startup: &mpsc::SyncSender<Result<(), String>>,
 ) -> Result<(), String> {
     initialize_mta()
@@ -316,14 +519,24 @@ fn run_capture_inner(
     audio_client
         .start_stream()
         .map_err(|error| format!("failed to start loopback capture: {error}"))?;
+    runtime.set_state(AudioRuntimeState::Running);
     startup
         .send(Ok(()))
         .map_err(|error| format!("audio startup receiver dropped: {error}"))?;
 
+    let mut consecutive_event_timeouts = 0;
     while !stop.load(Ordering::Acquire) {
         if event.wait_for_event(EVENT_WAIT_MILLIS).is_err() {
+            consecutive_event_timeouts += 1;
+            if consecutive_event_timeouts >= HEALTH_CHECK_TIMEOUTS {
+                audio_client.get_current_padding().map_err(|error| {
+                    format!("output device became unavailable while waiting for audio: {error}")
+                })?;
+                consecutive_event_timeouts = 0;
+            }
             continue;
         }
+        consecutive_event_timeouts = 0;
 
         while capture_client
             .get_next_packet_size()
@@ -356,37 +569,69 @@ fn run_dsp(
     mut consumer: CaptureConsumer,
     stop: Arc<AtomicBool>,
     stats: Arc<SharedStats>,
+    shared_performance: Arc<SharedDspPerformance>,
+    runtime: Arc<SharedRuntime>,
     feature_sink: FeatureSink,
+    performance_sink: PerformanceSink,
+    mut ai_producer: CaptureProducer,
+    ai_pcm: Arc<SharedAiPcm>,
 ) {
     let mut samples = [0.0_f32; 2048];
     let mut analyzer = None;
+    let mut metrics = None;
     let mut last_report = Instant::now();
     let mut last_feature_event = Instant::now() - FEATURE_EVENT_INTERVAL;
     let mut last_captured_frames = 0;
+    let mut observed_capture_drops = 0;
 
     while !stop.load(Ordering::Acquire) {
         if analyzer.is_none() {
             let sample_rate_hz = stats.sample_rate_hz.load(Ordering::Acquire) as u32;
             if sample_rate_hz > 0 {
                 analyzer = Some(FastDsp::new(sample_rate_hz));
+                metrics = Some(DspMetrics::new(sample_rate_hz, DSP_HOP_SIZE));
             }
         }
 
         let count = consumer.pop_slice(&mut samples);
         if count == 0 {
             thread::park_timeout(Duration::from_millis(2));
-        } else if let Some(analyzer) = analyzer.as_mut() {
-            analyzer.process(&samples[..count], |features| {
+        } else if let (Some(analyzer), Some(metrics)) = (analyzer.as_mut(), metrics.as_mut()) {
+            let capture_drops = stats.dropped_samples.load(Ordering::Relaxed);
+            if ai_pcm.is_enabled() {
+                if capture_drops > observed_capture_drops {
+                    ai_pcm.report_discontinuity((capture_drops - observed_capture_drops) as usize);
+                }
+                if ai_producer.vacant_len() >= count {
+                    let written = ai_producer.push_slice(&samples[..count]);
+                    debug_assert_eq!(written, count);
+                } else {
+                    ai_pcm.report_discontinuity(count);
+                }
+            }
+            observed_capture_drops = capture_drops;
+            let sample_rate_hz = stats.sample_rate_hz.load(Ordering::Relaxed);
+            let pipeline_lag_us = if sample_rate_hz > 0 {
+                ((consumer.occupied_len() as u64 * 1_000_000) / sample_rate_hz)
+                    .min(u64::from(u32::MAX)) as u32
+            } else {
+                0
+            };
+            analyzer.process(&samples[..count], |features, compute_time| {
                 stats.publish_features(features);
                 if last_feature_event.elapsed() >= FEATURE_EVENT_INTERVAL {
                     feature_sink(features);
                     last_feature_event = Instant::now();
                 }
+                if let Some(performance) = metrics.record(compute_time, pipeline_lag_us) {
+                    shared_performance.publish(performance);
+                    performance_sink(performance);
+                }
             });
         }
 
         if cfg!(debug_assertions) && last_report.elapsed() >= Duration::from_secs(1) {
-            let snapshot = stats.snapshot(true);
+            let snapshot = stats.snapshot(&runtime);
             let frames_per_second = snapshot.captured_frames - last_captured_frames;
             eprintln!(
                 "[audio] dsp: frames/s={}, seq={}, rms={:.5}, bands={:.3}/{:.3}/{:.3}, onset={:.3}, centroid={:.3}, trend={:.3}, silence={}, dropped={}",
@@ -455,7 +700,7 @@ impl FastDsp {
         }
     }
 
-    fn process(&mut self, samples: &[f32], mut publish: impl FnMut(AudioFeatures)) {
+    fn process(&mut self, samples: &[f32], mut publish: impl FnMut(AudioFeatures, Duration)) {
         for &sample in samples {
             self.history[self.write_index] = sample;
             self.write_index = (self.write_index + 1) % FFT_SIZE;
@@ -465,7 +710,9 @@ impl FastDsp {
 
             if self.filled == FFT_SIZE && self.samples_since_analysis >= DSP_HOP_SIZE {
                 self.samples_since_analysis = 0;
-                publish(self.analyze());
+                let started_at = Instant::now();
+                let features = self.analyze();
+                publish(features, started_at.elapsed());
             }
         }
     }
@@ -590,7 +837,7 @@ mod tests {
     fn analyze(samples: &[f32]) -> Vec<AudioFeatures> {
         let mut analyzer = FastDsp::new(TEST_SAMPLE_RATE);
         let mut features = Vec::new();
-        analyzer.process(samples, |snapshot| features.push(snapshot));
+        analyzer.process(samples, |snapshot, _| features.push(snapshot));
         features
     }
 
@@ -624,13 +871,13 @@ mod tests {
     fn detects_silence_and_sudden_onset() {
         let mut analyzer = FastDsp::new(TEST_SAMPLE_RATE);
         let mut snapshots = Vec::new();
-        analyzer.process(&vec![0.0; FFT_SIZE + DSP_HOP_SIZE], |snapshot| {
+        analyzer.process(&vec![0.0; FFT_SIZE + DSP_HOP_SIZE], |snapshot, _| {
             snapshots.push(snapshot)
         });
         assert!(snapshots.last().expect("silence snapshot").silence);
 
         let burst = sine_wave(1_000.0, DSP_HOP_SIZE, 0.8);
-        analyzer.process(&burst, |snapshot| snapshots.push(snapshot));
+        analyzer.process(&burst, |snapshot, _| snapshots.push(snapshot));
         let snapshot = snapshots.last().expect("burst snapshot");
 
         assert!(!snapshot.silence);
@@ -640,11 +887,27 @@ mod tests {
     }
 
     #[test]
+    fn runtime_failure_is_visible_in_status() {
+        let stats = SharedStats::default();
+        let runtime = SharedRuntime::new();
+        assert_eq!(stats.snapshot(&runtime).state, AudioRuntimeState::Starting);
+
+        runtime.set_state(AudioRuntimeState::Running);
+        assert!(stats.snapshot(&runtime).running);
+
+        runtime.fail("device invalidated".into());
+        let status = stats.snapshot(&runtime);
+        assert!(!status.running);
+        assert_eq!(status.state, AudioRuntimeState::Failed);
+        assert_eq!(status.last_error.as_deref(), Some("device invalidated"));
+    }
+
+    #[test]
     #[ignore = "requires a Windows default render device"]
     fn starts_and_stops_default_render_device() {
         let monitor = AudioMonitor::default();
         let started = monitor
-            .start(Arc::new(|_| {}))
+            .start(Arc::new(|_| {}), Arc::new(|_| {}))
             .expect("WASAPI monitor should start");
         assert!(started.running);
         assert!(started.sample_rate_hz > 0);

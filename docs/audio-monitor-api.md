@@ -2,17 +2,27 @@
 
 ## 1. 概述
 
-Rust 后端通过 Tauri Command 提供系统音频监听的启动、停止和状态查询接口，并通过 Tauri Event 主动推送快速 DSP 特征。
+Rust 后端通过 Tauri Command 提供系统音频监听的启动、停止和状态查询接口，通过 Tauri Event 主动推送快速 DSP 特征，并通过二进制 Tauri Channel 发送 AI PCM 窗口。
 
 - Command 用于生命周期控制和低频状态面板。
 - `audio-features` Event 用于 30–60 Hz 动态滤镜驱动。
-- 前端不接收原始 PCM，不应通过高频轮询驱动滤镜。
+- AI PCM Channel 用于前端 Web Worker 的慢速模型输入，不应通过 JSON Event 传输。
+- 前端不应通过高频轮询驱动滤镜。
 
 ## 2. 前端类型
 
 ```ts
+export type AudioRuntimeState =
+  | "stopped"
+  | "starting"
+  | "running"
+  | "stopping"
+  | "failed";
+
 export interface AudioStatus {
   running: boolean;
+  state: AudioRuntimeState;
+  lastError: string | null;
   sampleRateHz: number;
   channels: number;
   capturedFrames: number;
@@ -41,6 +51,31 @@ export interface AudioFeatures {
   energyTrend: number;
   silence: boolean;
 }
+
+export interface DspPerformance {
+  sampleCount: number;
+  windowMs: number;
+  lastUs: number;
+  p50Us: number;
+  p95Us: number;
+  p99Us: number;
+  maxUs: number;
+  pipelineLagUs: number;
+  deadlineMisses: number;
+}
+
+export interface AiPcmStatus {
+  enabled: boolean;
+  outputSampleRateHz: number;
+  windowSamples: number;
+  hopSamples: number;
+  streamEpoch: number;
+  sequence: number;
+  emittedWindows: number;
+  droppedInputSamples: number;
+  bufferedInputSamples: number;
+  lastError: string | null;
+}
 ```
 
 字段说明：
@@ -48,6 +83,8 @@ export interface AudioFeatures {
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `running` | `boolean` | 音频监听是否处于运行状态 |
+| `state` | `AudioRuntimeState` | 监听生命周期状态，设备失效后为 `failed` |
+| `lastError` | `string \| null` | 已启动会话的运行期错误；无错误时为 `null` |
 | `sampleRateHz` | `number` | WASAPI 输出设备采样率，例如 `44100` 或 `48000` |
 | `channels` | `number` | WASAPI 输出设备原始通道数；进入 DSP 前会下混为单声道 |
 | `capturedFrames` | `number` | 本次监听启动以来累计读取的音频帧数 |
@@ -105,7 +142,51 @@ unlisten();
 - 前端切换页面或组件卸载时必须调用 `unlisten`，避免重复订阅。
 - Event 发送失败不会停止 WASAPI 或 DSP 线程。
 
-## 4. 启动监听
+## 4. DSP 性能
+
+### Event
+
+```text
+audio-performance
+```
+
+### Command
+
+```text
+audio_performance_status
+```
+
+事件 Payload 和 Command 返回值均为 `DspPerformance`。事件约每秒发送一次；Command 无参数，适合页面初始化和按需查询。
+
+```ts
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+
+const initial = await invoke<DspPerformance>("audio_performance_status");
+const unlisten = await listen<DspPerformance>("audio-performance", ({ payload }) => {
+  updatePerformancePanel(payload);
+});
+```
+
+| 字段 | 单位 | 说明 |
+| --- | --- | --- |
+| `sampleCount` | 次 | 本次监听会话累计完成的 DSP 分析次数 |
+| `windowMs` | ms | 当前百分位窗口覆盖的近似音频时长，最多约 5–6 秒 |
+| `lastUs` | μs | 最近一次纯 DSP 分析耗时 |
+| `p50Us` | μs | 固定窗口内纯 DSP 分析耗时 P50 |
+| `p95Us` | μs | 固定窗口内纯 DSP 分析耗时 P95 |
+| `p99Us` | μs | 固定窗口内纯 DSP 分析耗时 P99 |
+| `maxUs` | μs | 固定窗口内纯 DSP 分析最大耗时 |
+| `pipelineLagUs` | μs | 本次读取后仍留在采集 RingBuffer 中的 PCM 对应时长 |
+| `deadlineMisses` | 次 | 纯 DSP 耗时超过一个 512 样本 hop 时长的累计次数 |
+
+计时范围只包含 Hann 窗、FFT 和特征计算，不包含 Tauri Event 发送。统计在 DSP 线程内使用固定容量数组记录，每秒最多排序一次，不在热路径分配统计缓冲。
+
+`pipelineLagUs` 用于观察前端 AI 或系统高负载造成的调度压力。它不包含 WebView 渲染延迟，也不是声音到画面的端到端延迟。
+
+监听未运行或首个性能窗口尚未生成时，`audio_performance_status` 返回全零对象。停止监听后该 Command 也返回全零对象。
+
+## 5. 启动监听
 
 ### Command
 
@@ -134,10 +215,11 @@ console.log("audio started", status);
 
 - 首次调用会创建 WASAPI 采集线程和 DSP 线程，并等待设备初始化完成。
 - 如果监听已经运行，则不会重复创建线程，直接返回当前状态。
+- 如果上一次会话已进入 `failed`，调用本接口会先回收旧线程，再重新获取当前默认输出设备并创建新会话。
 - 启动失败时 Promise 被拒绝，错误值为后端返回的字符串。
 - Debug 构建当前会在 Tauri 启动时自动调用监听；Release 构建需要前端显式调用本接口。
 
-## 5. 查询状态
+## 6. 查询状态
 
 ### Command
 
@@ -171,6 +253,8 @@ console.log({
 ```ts
 {
   running: false,
+  state: "stopped",
+  lastError: null,
   sampleRateHz: 0,
   channels: 0,
   capturedFrames: 0,
@@ -190,7 +274,14 @@ console.log({
 
 状态面板建议每 `500–1000 ms` 查询一次。不要以逐帧或 60 Hz 频率轮询该接口；滤镜应订阅 `audio-features` Event。
 
-## 6. 停止监听
+运行期间如果输出设备被拔出、驱动失效或 WASAPI 读取失败：
+
+- `state` 变为 `failed`，`running` 变为 `false`。
+- `lastError` 提供后端错误说明。
+- 快速特征和性能事件停止发送。
+- 前端可以再次调用 `start_audio_monitor` 手动重建监听；当前版本不会自动重连。
+
+## 7. 停止监听
 
 ### Command
 
@@ -222,13 +313,70 @@ console.log("audio stopped", finalStatus);
 - 如果监听尚未运行，返回全零默认状态。
 - 再次调用 `start_audio_monitor` 会创建新的监听会话，累计计数从零开始。
 
-## 7. 推荐封装
+## 8. AI PCM Channel
+
+AI PCM 链路要求音频监听已经处于 `running`。它将设备单声道 PCM 重采样为 16 kHz，并发送固定 3 秒窗口；相邻窗口步长为 1 秒。
+
+### Commands
+
+```text
+start_ai_pcm_stream
+stop_ai_pcm_stream
+ai_pcm_status
+```
+
+`start_ai_pcm_stream` 接收名为 `channel` 的 Tauri `Channel<ArrayBuffer>`。再次调用会替换旧 Channel，并开始一个新的 `streamEpoch`。`stop_ai_pcm_stream` 禁用 AI 数据复制、清空重采样状态并释放 Channel。`ai_pcm_status` 无参数。
+
+```ts
+import { Channel, invoke } from "@tauri-apps/api/core";
+
+const channel = new Channel<ArrayBuffer>();
+channel.onmessage = (payload) => {
+  const view = new DataView(payload);
+  const version = view.getUint32(0, true);
+  const sampleRateHz = view.getUint32(4, true);
+  const sampleCount = view.getUint32(8, true);
+  const streamEpoch = view.getBigUint64(16, true);
+  const sequence = view.getBigUint64(24, true);
+  const samples = new Float32Array(payload, 32, sampleCount);
+
+  enqueueLatestForAudioWorker({
+    version,
+    sampleRateHz,
+    streamEpoch,
+    sequence,
+    samples,
+  });
+};
+
+const status = await invoke<AiPcmStatus>("start_ai_pcm_stream", { channel });
+```
+
+二进制 Payload 全部使用小端序：
+
+| 偏移 | 长度 | 类型 | 内容 |
+| ---: | ---: | --- | --- |
+| 0 | 4 | `u32` | 协议版本，当前为 `1` |
+| 4 | 4 | `u32` | 采样率，固定为 `16000` |
+| 8 | 4 | `u32` | 样本数，固定为 `48000` |
+| 12 | 4 | `u32` | 保留字段，当前为 `0` |
+| 16 | 8 | `u64` | `streamEpoch` |
+| 24 | 8 | `u64` | 窗口 `sequence` |
+| 32 | 192000 | `f32[48000]` | 单声道 PCM |
+
+当采集 RingBuffer 或 AI RingBuffer 发生丢样时，Rust 会递增 `streamEpoch`，清空 AI RingBuffer，并重置重采样器和滑窗。前端不得跨 epoch 拼接或比较窗口序号。
+
+Tauri Channel 不提供模型消费确认。Channel 回调向 Web Worker 投递时，适配层必须采用单槽 latest-only 策略：模型忙时覆盖尚未开始推理的旧窗口，不建立无界队列。Channel 发送失败时 AI PCM 自动禁用，错误写入 `lastError`；快速 DSP 和 WASAPI 监听继续运行。
+
+## 8. 推荐封装
 
 ```ts
 import { invoke } from "@tauri-apps/api/core";
 
 export interface AudioStatus {
   running: boolean;
+  state: AudioRuntimeState;
+  lastError: string | null;
   sampleRateHz: number;
   channels: number;
   capturedFrames: number;
@@ -248,6 +396,7 @@ export interface AudioStatus {
 export const audioMonitorApi = {
   start: () => invoke<AudioStatus>("start_audio_monitor"),
   status: () => invoke<AudioStatus>("audio_monitor_status"),
+  performance: () => invoke<DspPerformance>("audio_performance_status"),
   stop: () => invoke<AudioStatus>("stop_audio_monitor"),
 };
 ```
@@ -263,7 +412,7 @@ try {
 }
 ```
 
-## 8. 当前边界
+## 9. 当前边界
 
 当前版本仅提供：
 
