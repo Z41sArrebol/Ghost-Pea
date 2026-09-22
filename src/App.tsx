@@ -80,6 +80,11 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
     setParams((prev) => ({ ...prev, [key]: value }));
   }, []);
 
+  const refreshCameras = useCallback(async () => {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    setCameras(devices.filter((d) => d.kind === "videoinput"));
+  }, []);
+
   const startCamera = useCallback(async (config: CameraConfig) => {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
@@ -101,16 +106,21 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
         await video.play();
       }
       setCameraError("");
-      const devices = await navigator.mediaDevices.enumerateDevices();
-      setCameras(devices.filter((d) => d.kind === "videoinput"));
+      await refreshCameras();
     } catch (error) {
       setCameraError(`相机不可用：${error instanceof Error ? error.message : String(error)}`);
     }
-  }, []);
+  }, [refreshCameras]);
 
   useEffect(() => {
     void startCamera(cameraConfig);
   }, [cameraConfig, startCamera]);
+
+  useEffect(() => {
+    const onDeviceChange = () => void refreshCameras();
+    navigator.mediaDevices.addEventListener("devicechange", onDeviceChange);
+    return () => navigator.mediaDevices.removeEventListener("devicechange", onDeviceChange);
+  }, [refreshCameras]);
 
   useEffect(() => {
     let renderer: FilterRenderer | null = null;
