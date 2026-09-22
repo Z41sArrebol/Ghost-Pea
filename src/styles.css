@@ -168,6 +168,15 @@ body {
   border-radius: 3px;
 }
 
+.mode-control {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
 .panel {
   flex: 1;
   overflow-y: auto;
