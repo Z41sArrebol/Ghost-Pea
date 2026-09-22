@@ -1,11 +1,26 @@
 mod audio;
 
-use audio::{AudioMonitor, AudioStatus};
-use tauri::{Manager, State};
+use std::sync::Arc;
+
+use audio::{AudioFeatures, AudioMonitor, AudioStatus, FeatureSink};
+use tauri::{AppHandle, Emitter, Manager, State};
+
+const AUDIO_FEATURES_EVENT: &str = "audio-features";
+
+fn feature_sink(app: AppHandle) -> FeatureSink {
+    Arc::new(move |features: AudioFeatures| {
+        if let Err(error) = app.emit(AUDIO_FEATURES_EVENT, features) {
+            eprintln!("[audio] failed to emit features: {error}");
+        }
+    })
+}
 
 #[tauri::command]
-fn start_audio_monitor(monitor: State<'_, AudioMonitor>) -> Result<AudioStatus, String> {
-    monitor.start()
+fn start_audio_monitor(
+    app: AppHandle,
+    monitor: State<'_, AudioMonitor>,
+) -> Result<AudioStatus, String> {
+    monitor.start(feature_sink(app))
 }
 
 #[tauri::command]
@@ -26,7 +41,7 @@ pub fn run() {
             #[cfg(debug_assertions)]
             {
                 let monitor = app.state::<AudioMonitor>();
-                if let Err(error) = monitor.start() {
+                if let Err(error) = monitor.start(feature_sink(app.handle().clone())) {
                     eprintln!("[audio] failed to auto-start monitor: {error}");
                 }
             }
