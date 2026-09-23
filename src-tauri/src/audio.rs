@@ -1,5 +1,6 @@
 mod ai_pcm;
 mod metrics;
+mod microphone_mix;
 
 use std::{
     sync::{
@@ -19,6 +20,7 @@ use ai_pcm::SharedAiPcm;
 pub use ai_pcm::{AiPcmStatus, WindowSink};
 pub use metrics::DspPerformance;
 use metrics::{DspMetrics, SharedDspPerformance};
+use microphone_mix::MicrophoneMix;
 
 const CAPTURE_BUFFER_MILLIS: usize = 250;
 const MAX_AI_INPUT_SAMPLE_RATE_HZ: usize = 192_000;
@@ -195,10 +197,13 @@ pub struct AudioFeatures {
 
 struct RunningAudio {
     stop: Arc<AtomicBool>,
+    microphone_stop: Arc<AtomicBool>,
     capture_thread: JoinHandle<()>,
+    microphone_thread: Option<JoinHandle<()>>,
     dsp_thread: JoinHandle<()>,
     ai_pcm_thread: JoinHandle<()>,
     stats: Arc<SharedStats>,
+    microphone_stats: Arc<SharedStats>,
     performance: Arc<SharedDspPerformance>,
     runtime: Arc<SharedRuntime>,
     ai_pcm: Arc<SharedAiPcm>,
@@ -235,10 +240,16 @@ impl AudioMonitor {
 
         if let Some(stale) = running.take() {
             stale.stop.store(true, Ordering::Release);
+            stale.microphone_stop.store(true, Ordering::Release);
             stale
                 .capture_thread
                 .join()
                 .map_err(|_| "previous WASAPI thread panicked")?;
+            if let Some(thread) = stale.microphone_thread {
+                thread
+                    .join()
+                    .map_err(|_| "previous microphone thread panicked")?;
+            }
             stale
                 .dsp_thread
                 .join()
@@ -250,12 +261,16 @@ impl AudioMonitor {
         }
 
         let stop = Arc::new(AtomicBool::new(false));
+        let microphone_stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(SharedStats::default());
         let performance = Arc::new(SharedDspPerformance::default());
         let runtime = Arc::new(SharedRuntime::new());
-        let capacity = 48_000 * CAPTURE_BUFFER_MILLIS / 1_000;
+        let capacity = MAX_AI_INPUT_SAMPLE_RATE_HZ * CAPTURE_BUFFER_MILLIS / 1_000;
         let ring = HeapRb::<f32>::new(capacity);
         let (producer, consumer) = ring.split();
+        let microphone_ring = HeapRb::<f32>::new(capacity);
+        let (microphone_producer, microphone_consumer) = microphone_ring.split();
+        let microphone_stats = Arc::new(SharedStats::default());
         let ai_ring =
             HeapRb::<f32>::new(MAX_AI_INPUT_SAMPLE_RATE_HZ * ai_pcm::RING_BUFFER_MILLIS / 1_000);
         let (ai_producer, ai_consumer) = ai_ring.split();
@@ -274,20 +289,25 @@ impl AudioMonitor {
         let dsp_performance = Arc::clone(&performance);
         let dsp_runtime = Arc::clone(&runtime);
         let dsp_ai_pcm = Arc::clone(&ai_pcm);
+        let dsp_microphone_stats = Arc::clone(&microphone_stats);
         let dsp_thread =
             match thread::Builder::new()
                 .name("ghost-pea-dsp".into())
                 .spawn(move || {
                     run_dsp(
-                        consumer,
+                        DspChannels {
+                            consumer,
+                            microphone_consumer,
+                            microphone_stats: dsp_microphone_stats,
+                            ai_producer,
+                            ai_pcm: dsp_ai_pcm,
+                        },
                         dsp_stop,
                         dsp_stats,
                         dsp_performance,
                         dsp_runtime,
                         feature_sink,
                         performance_sink,
-                        ai_producer,
-                        dsp_ai_pcm,
                     )
                 }) {
                 Ok(handle) => handle,
@@ -299,6 +319,7 @@ impl AudioMonitor {
             };
 
         let capture_stop = Arc::clone(&stop);
+        let capture_microphone_stop = Arc::clone(&microphone_stop);
         let capture_stats = Arc::clone(&stats);
         let capture_runtime = Arc::clone(&runtime);
         let (startup_tx, startup_rx) = mpsc::sync_channel(1);
@@ -316,6 +337,7 @@ impl AudioMonitor {
                         capture_runtime.fail(error.clone());
                     }
                     capture_stop.store(true, Ordering::Release);
+                    capture_microphone_stop.store(true, Ordering::Release);
                     eprintln!("WASAPI capture stopped: {error}");
                 }
             }) {
@@ -330,6 +352,47 @@ impl AudioMonitor {
 
         match startup_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(())) => {
+                let mic_stop = Arc::clone(&microphone_stop);
+                let mic_stats = Arc::clone(&microphone_stats);
+                let (mic_tx, mic_rx) = mpsc::sync_channel(1);
+                let microphone_thread = match thread::Builder::new()
+                    .name("ghost-pea-microphone".into())
+                    .spawn(move || {
+                        if let Err(error) = run_microphone_capture(
+                            microphone_producer,
+                            &mic_stop,
+                            &mic_stats,
+                            mic_tx,
+                        ) {
+                            eprintln!("[audio] microphone unavailable: {error}");
+                        }
+                        mic_stats.sample_rate_hz.store(0, Ordering::Release);
+                    }) {
+                    Ok(handle) => match mic_rx.recv_timeout(Duration::from_secs(3)) {
+                        Ok(Ok(())) => {
+                            eprintln!(
+                                "[audio] microphone active: {} Hz, {} channels",
+                                microphone_stats.sample_rate_hz.load(Ordering::Acquire),
+                                microphone_stats.channels.load(Ordering::Relaxed)
+                            );
+                            Some(handle)
+                        }
+                        Ok(Err(error)) => {
+                            eprintln!("[audio] using system audio only: {error}");
+                            let _ = handle.join();
+                            None
+                        }
+                        Err(error) => {
+                            eprintln!("[audio] microphone startup uncertain, using system audio only: {error}");
+                            microphone_stop.store(true, Ordering::Release);
+                            Some(handle)
+                        }
+                    },
+                    Err(error) => {
+                        eprintln!("[audio] using system audio only: failed to spawn microphone thread: {error}");
+                        None
+                    }
+                };
                 let status = stats.snapshot(&runtime);
                 eprintln!(
                     "[audio] monitor started: {} Hz, {} channels",
@@ -337,10 +400,13 @@ impl AudioMonitor {
                 );
                 *running = Some(RunningAudio {
                     stop,
+                    microphone_stop,
                     capture_thread,
+                    microphone_thread,
                     dsp_thread,
                     ai_pcm_thread,
                     stats,
+                    microphone_stats,
                     performance,
                     runtime,
                     ai_pcm,
@@ -383,10 +449,14 @@ impl AudioMonitor {
 
         active.runtime.set_state(AudioRuntimeState::Stopping);
         active.stop.store(true, Ordering::Release);
+        active.microphone_stop.store(true, Ordering::Release);
         active
             .capture_thread
             .join()
             .map_err(|_| "WASAPI thread panicked")?;
+        if let Some(thread) = active.microphone_thread {
+            thread.join().map_err(|_| "microphone thread panicked")?;
+        }
         active
             .dsp_thread
             .join()
@@ -398,8 +468,11 @@ impl AudioMonitor {
         active.runtime.set_state(AudioRuntimeState::Stopped);
         let status = active.stats.snapshot(&active.runtime);
         eprintln!(
-            "[audio] monitor stopped: captured_frames={}, dropped_samples={}",
-            status.captured_frames, status.dropped_samples
+            "[audio] monitor stopped: captured_frames={}, dropped_samples={}, mic_frames={}, mic_dropped={}",
+            status.captured_frames,
+            status.dropped_samples,
+            active.microphone_stats.captured_frames.load(Ordering::Relaxed),
+            active.microphone_stats.dropped_samples.load(Ordering::Relaxed)
         );
         Ok(status)
     }
@@ -470,26 +543,64 @@ fn run_capture_inner(
     runtime: &SharedRuntime,
     startup: &mpsc::SyncSender<Result<(), String>>,
 ) -> Result<(), String> {
+    run_device_capture(
+        producer,
+        stop,
+        stats,
+        Some(runtime),
+        startup,
+        Direction::Render,
+    )
+}
+
+fn run_microphone_capture(
+    mut producer: CaptureProducer,
+    stop: &AtomicBool,
+    stats: &SharedStats,
+    startup: mpsc::SyncSender<Result<(), String>>,
+) -> Result<(), String> {
+    let result = run_device_capture(
+        &mut producer,
+        stop,
+        stats,
+        None,
+        &startup,
+        Direction::Capture,
+    );
+    if let Err(error) = &result {
+        let _ = startup.send(Err(error.clone()));
+    }
+    result
+}
+
+fn run_device_capture(
+    producer: &mut CaptureProducer,
+    stop: &AtomicBool,
+    stats: &SharedStats,
+    runtime: Option<&SharedRuntime>,
+    startup: &mpsc::SyncSender<Result<(), String>>,
+    device_direction: Direction,
+) -> Result<(), String> {
     initialize_mta()
         .ok()
         .map_err(|error| format!("failed to initialize COM: {error}"))?;
 
     let enumerator = DeviceEnumerator::new().map_err(|error| error.to_string())?;
     let device = enumerator
-        .get_default_device(&Direction::Render)
-        .map_err(|error| format!("failed to get default output device: {error}"))?;
+        .get_default_device(&device_direction)
+        .map_err(|error| format!("failed to get default {device_direction:?} device: {error}"))?;
     let mut audio_client = device
         .get_iaudioclient()
         .map_err(|error| format!("failed to create audio client: {error}"))?;
     let mix_format = audio_client
         .get_mixformat()
-        .map_err(|error| format!("failed to read output mix format: {error}"))?;
+        .map_err(|error| format!("failed to read device mix format: {error}"))?;
 
     let sample_rate = mix_format.get_samplespersec();
     let channels = mix_format.get_nchannels();
     mix_format
         .get_subformat()
-        .map_err(|error| format!("unsupported output sample format: {error}"))?;
+        .map_err(|error| format!("unsupported device sample format: {error}"))?;
     let desired_format = WaveFormat::new(
         32,
         32,
@@ -500,7 +611,7 @@ fn run_capture_inner(
     );
     let (default_period, _) = audio_client
         .get_device_period()
-        .map_err(|error| format!("failed to get output device period: {error}"))?;
+        .map_err(|error| format!("failed to get device period: {error}"))?;
     let mode = StreamMode::EventsShared {
         autoconvert: true,
         buffer_duration_hns: default_period,
@@ -508,7 +619,7 @@ fn run_capture_inner(
 
     audio_client
         .initialize_client(&desired_format, &Direction::Capture, &mode)
-        .map_err(|error| format!("failed to initialize loopback capture: {error}"))?;
+        .map_err(|error| format!("failed to initialize device capture: {error}"))?;
     let event = audio_client
         .set_get_eventhandle()
         .map_err(|error| format!("failed to create WASAPI event: {error}"))?;
@@ -527,8 +638,10 @@ fn run_capture_inner(
     stats.channels.store(channels as u64, Ordering::Relaxed);
     audio_client
         .start_stream()
-        .map_err(|error| format!("failed to start loopback capture: {error}"))?;
-    runtime.set_state(AudioRuntimeState::Running);
+        .map_err(|error| format!("failed to start device capture: {error}"))?;
+    if let Some(runtime) = runtime {
+        runtime.set_state(AudioRuntimeState::Running);
+    }
     startup
         .send(Ok(()))
         .map_err(|error| format!("audio startup receiver dropped: {error}"))?;
@@ -539,7 +652,7 @@ fn run_capture_inner(
             consecutive_event_timeouts += 1;
             if consecutive_event_timeouts >= HEALTH_CHECK_TIMEOUTS {
                 audio_client.get_current_padding().map_err(|error| {
-                    format!("output device became unavailable while waiting for audio: {error}")
+                    format!("audio device became unavailable while waiting for audio: {error}")
                 })?;
                 consecutive_event_timeouts = 0;
             }
@@ -557,7 +670,7 @@ fn run_capture_inner(
 
             let (frames, _) = capture_client
                 .read_from_device(&mut bytes)
-                .map_err(|error| format!("failed to read loopback packet: {error}"))?;
+                .map_err(|error| format!("failed to read capture packet: {error}"))?;
             let frames = frames as usize;
             if frames == 0 {
                 break;
@@ -577,25 +690,40 @@ fn run_capture_inner(
 
     audio_client
         .stop_stream()
-        .map_err(|error| format!("failed to stop loopback capture: {error}"))
+        .map_err(|error| format!("failed to stop device capture: {error}"))
 }
 
 fn should_read_capture_packet(stopping: bool, packet_frames: Option<u32>) -> bool {
     !stopping && packet_frames.is_some_and(|frames| frames > 0)
 }
 
+struct DspChannels {
+    consumer: CaptureConsumer,
+    microphone_consumer: CaptureConsumer,
+    microphone_stats: Arc<SharedStats>,
+    ai_producer: CaptureProducer,
+    ai_pcm: Arc<SharedAiPcm>,
+}
+
 fn run_dsp(
-    mut consumer: CaptureConsumer,
+    channels: DspChannels,
     stop: Arc<AtomicBool>,
     stats: Arc<SharedStats>,
     shared_performance: Arc<SharedDspPerformance>,
     runtime: Arc<SharedRuntime>,
     feature_sink: FeatureSink,
     performance_sink: PerformanceSink,
-    mut ai_producer: CaptureProducer,
-    ai_pcm: Arc<SharedAiPcm>,
 ) {
+    let DspChannels {
+        mut consumer,
+        mut microphone_consumer,
+        microphone_stats,
+        mut ai_producer,
+        ai_pcm,
+    } = channels;
     let mut samples = [0.0_f32; 2048];
+    let mut microphone_samples = [0.0_f32; 2048];
+    let mut microphone_mix = None;
     let mut analyzer = None;
     let mut metrics = None;
     let mut last_report = Instant::now();
@@ -612,10 +740,36 @@ fn run_dsp(
             }
         }
 
-        let count = consumer.pop_slice(&mut samples);
+        let mut count = consumer.pop_slice(&mut samples);
+        if count == 0 {
+            count = microphone_driven_frames(
+                microphone_consumer.occupied_len(),
+                microphone_stats.sample_rate_hz.load(Ordering::Acquire) as u32,
+                stats.sample_rate_hz.load(Ordering::Acquire) as u32,
+            )
+            .min(samples.len());
+            samples[..count].fill(0.0);
+        }
         if count == 0 {
             thread::park_timeout(Duration::from_millis(2));
         } else if let (Some(analyzer), Some(metrics)) = (analyzer.as_mut(), metrics.as_mut()) {
+            let microphone_rate = microphone_stats.sample_rate_hz.load(Ordering::Acquire) as u32;
+            if microphone_rate > 0 && microphone_mix.is_none() {
+                microphone_mix = Some(MicrophoneMix::new(microphone_rate, analyzer.sample_rate_hz));
+            }
+            if microphone_rate == 0 {
+                microphone_mix = None;
+                microphone_consumer.skip(microphone_consumer.occupied_len());
+            } else if let Some(mixer) = microphone_mix.as_mut() {
+                loop {
+                    let mic_count = microphone_consumer.pop_slice(&mut microphone_samples);
+                    if mic_count == 0 {
+                        break;
+                    }
+                    mixer.push(&microphone_samples[..mic_count]);
+                }
+                mixer.mix(&mut samples[..count]);
+            }
             let capture_drops = stats.dropped_samples.load(Ordering::Relaxed);
             if ai_pcm.is_enabled() {
                 if capture_drops > observed_capture_drops {
@@ -653,10 +807,11 @@ fn run_dsp(
             let snapshot = stats.snapshot(&runtime);
             let frames_per_second = snapshot.captured_frames - last_captured_frames;
             eprintln!(
-                "[audio] dsp: frames/s={}, seq={}, rms={:.5}, bands={:.3}/{:.3}/{:.3}, onset={:.3}, centroid={:.3}, trend={:.3}, silence={}, dropped={}",
+                "[audio] dsp: frames/s={}, seq={}, rms={:.5}, mic_level={:.5}, bands={:.3}/{:.3}/{:.3}, onset={:.3}, centroid={:.3}, trend={:.3}, silence={}, dropped={}, mic_dropped={}",
                 frames_per_second,
                 snapshot.sequence,
                 snapshot.rms,
+                microphone_mix.as_ref().map_or(0.0, MicrophoneMix::input_level),
                 snapshot.bass,
                 snapshot.mid,
                 snapshot.treble,
@@ -664,11 +819,27 @@ fn run_dsp(
                 snapshot.centroid,
                 snapshot.energy_trend,
                 snapshot.silence,
-                snapshot.dropped_samples
+                snapshot.dropped_samples,
+                microphone_stats.dropped_samples.load(Ordering::Relaxed)
             );
             last_captured_frames = snapshot.captured_frames;
             last_report = Instant::now();
         }
+    }
+}
+
+fn microphone_driven_frames(
+    microphone_available: usize,
+    microphone_rate: u32,
+    output_rate: u32,
+) -> usize {
+    if microphone_rate == 0
+        || output_rate == 0
+        || microphone_available < microphone_rate as usize / 100
+    {
+        0
+    } else {
+        (output_rate / 100) as usize
     }
 }
 
@@ -866,6 +1037,14 @@ mod tests {
         assert!(!should_read_capture_packet(false, Some(0)));
         assert!(!should_read_capture_packet(false, None));
         assert!(should_read_capture_packet(false, Some(128)));
+    }
+
+    #[test]
+    fn microphone_drives_dsp_without_loopback_packets() {
+        assert_eq!(microphone_driven_frames(480, 48_000, 48_000), 480);
+        assert_eq!(microphone_driven_frames(441, 44_100, 48_000), 480);
+        assert_eq!(microphone_driven_frames(100, 48_000, 48_000), 0);
+        assert_eq!(microphone_driven_frames(480, 0, 48_000), 0);
     }
 
     #[test]
