@@ -5,6 +5,7 @@ const FLOAT_UNIFORMS = [
   "uTime", "uBypass", "uContrast", "uBrightness", "uTemperature", "uShadowCool",
   "uHighlightThr", "uVignette", "uGrain", "uBloom", "uBloomWarm",
   "uLookDark", "uLookCalm", "uLookBright", "uSoftClip", "uSaturation", "uGammaMid",
+  "uLookHappy", "uLookSad", "uLookRelaxed", "uLookAggressive",
 ] as const;
 
 export type UniformValues = Record<(typeof FLOAT_UNIFORMS)[number], number>;
@@ -13,6 +14,16 @@ export type FitMode = "cover" | "contain";
 // 三级多尺度柔光：1/4、1/8、1/16 分辨率，结构参考 three.js UnrealBloomPass（MIT）。
 const BLOOM_LEVELS = 3;
 const BLOOM_UNITS = [1, 5, 6] as const;
+// 三张主题 LUT 用 unit 2/3/4，四张情绪 LUT 用 unit 7-10（0 画面、1/5/6 柔光已占用）。
+const LUT_BINDINGS = [
+  { look: "dark", name: "uDarkLut", unit: 2 },
+  { look: "calm", name: "uCalmLut", unit: 3 },
+  { look: "bright", name: "uBrightLut", unit: 4 },
+  { look: "happy", name: "uHappyLut", unit: 7 },
+  { look: "sad", name: "uSadLut", unit: 8 },
+  { look: "relaxed", name: "uRelaxedLut", unit: 9 },
+  { look: "aggressive", name: "uAggressiveLut", unit: 10 },
+] as const satisfies readonly { look: Look; name: string; unit: number }[];
 
 type Program = { handle: WebGLProgram; uniforms: Map<string, WebGLUniformLocation | null> };
 type Target = { texture: WebGLTexture; framebuffer: WebGLFramebuffer };
@@ -67,7 +78,7 @@ export class FilterRenderer {
       this.source = this.createTexture2D();
       this.emptyBloom = this.createTexture2D();
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-      for (const look of ["dark", "calm", "bright"] as Look[]) {
+      for (const { look } of LUT_BINDINGS) {
         const texture = gl.createTexture();
         if (!texture) throw new Error("无法创建调色纹理");
         this.textures.push(texture);
@@ -104,7 +115,7 @@ export class FilterRenderer {
       }
       gl.linkProgram(handle);
       if (!gl.getProgramParameter(handle, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(handle) || "shader 链接失败");
-      const names = [...FLOAT_UNIFORMS, "uTexture", "uBloomTex0", "uBloomTex1", "uBloomTex2", "uDarkLut", "uCalmLut", "uBrightLut", "uUvScaleX", "uUvScaleY", "uDirection"];
+      const names = [...FLOAT_UNIFORMS, "uTexture", "uBloomTex0", "uBloomTex1", "uBloomTex2", ...LUT_BINDINGS.map(({ name }) => name), "uUvScaleX", "uUvScaleY", "uDirection"];
       const program = { handle, uniforms: new Map(names.map((name) => [name, gl.getUniformLocation(handle, name)])) };
       this.programs.push(program);
       return program;
@@ -205,10 +216,10 @@ export class FilterRenderer {
     for (const name of FLOAT_UNIFORMS) gl.uniform1f(program.uniforms.get(name) ?? null, values[name]);
     gl.uniform1f(program.uniforms.get("uUvScaleX") ?? null, scaleX);
     gl.uniform1f(program.uniforms.get("uUvScaleY") ?? null, scaleY);
-    for (const [index, name] of ["uDarkLut", "uCalmLut", "uBrightLut"].entries()) {
-      gl.activeTexture(gl.TEXTURE0 + index + 2);
+    for (const [index, { name, unit }] of LUT_BINDINGS.entries()) {
+      gl.activeTexture(gl.TEXTURE0 + unit);
       gl.bindTexture(gl.TEXTURE_3D, this.luts[index]);
-      gl.uniform1i(program.uniforms.get(name) ?? null, index + 2);
+      gl.uniform1i(program.uniforms.get(name) ?? null, unit);
     }
   }
 

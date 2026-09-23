@@ -16,6 +16,10 @@ uniform sampler2D uTexture;
 uniform sampler3D uDarkLut;
 uniform sampler3D uCalmLut;
 uniform sampler3D uBrightLut;
+uniform sampler3D uHappyLut;
+uniform sampler3D uSadLut;
+uniform sampler3D uRelaxedLut;
+uniform sampler3D uAggressiveLut;
 uniform float uUvScaleX;
 uniform float uUvScaleY;
 uniform float uContrast;
@@ -26,6 +30,10 @@ uniform float uHighlightThr;
 uniform float uLookDark;
 uniform float uLookCalm;
 uniform float uLookBright;
+uniform float uLookHappy;
+uniform float uLookSad;
+uniform float uLookRelaxed;
+uniform float uLookAggressive;
 uniform float uSoftClip;
 uniform float uSaturation;
 uniform float uGammaMid;
@@ -44,11 +52,16 @@ vec3 grade(vec3 source) {
   vec3 shoulder = knee + over * (1.0 - knee) / ((1.0 - knee) + over);
   c = mix(clamp(c, 0.0, 1.0), clamp(shoulder, 0.0, 1.0), step(knee, c) * uSoftClip);
   vec3 uvw = (c * ${LUT_SIZE - 1}.0 + 0.5) / ${LUT_SIZE}.0;
-  float total = uLookDark + uLookCalm + uLookBright;
+  // 三张主题 LUT（用户风格）+ 四张情绪专属 LUT（AI 氛围），总权重恒 ≤1，全零时退化为原色。
+  float total = uLookDark + uLookCalm + uLookBright + uLookHappy + uLookSad + uLookRelaxed + uLookAggressive;
   c = c * max(0.0, 1.0 - total)
     + texture(uDarkLut, uvw).rgb * uLookDark
     + texture(uCalmLut, uvw).rgb * uLookCalm
-    + texture(uBrightLut, uvw).rgb * uLookBright;
+    + texture(uBrightLut, uvw).rgb * uLookBright
+    + texture(uHappyLut, uvw).rgb * uLookHappy
+    + texture(uSadLut, uvw).rgb * uLookSad
+    + texture(uRelaxedLut, uvw).rgb * uLookRelaxed
+    + texture(uAggressiveLut, uvw).rgb * uLookAggressive;
   vec3 temperature = uTemperature < 0.0
     ? mix(vec3(1.0), vec3(1.08, 1.0, 0.9), -uTemperature)
     : mix(vec3(1.0), vec3(0.88, 0.97, 1.12), uTemperature);

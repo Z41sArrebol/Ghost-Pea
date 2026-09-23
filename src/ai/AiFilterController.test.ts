@@ -37,7 +37,8 @@ function expectBounded(result: RenderParameters) {
     expect(result[key]).toBeGreaterThanOrEqual(OUTPUT_LIMITS[key][0] - 1e-12);
     expect(result[key]).toBeLessThanOrEqual(OUTPUT_LIMITS[key][1] + 1e-12);
   }
-  expect(result.lookDark + result.lookCalm + result.lookBright).toBeLessThanOrEqual(1 + 1e-12);
+  expect(result.lookDark + result.lookCalm + result.lookBright
+    + result.lookHappy + result.lookSad + result.lookRelaxed + result.lookAggressive).toBeLessThanOrEqual(1 + 1e-12);
 }
 
 describe("AiFilterController", () => {
@@ -60,16 +61,18 @@ describe("AiFilterController", () => {
     expect(happy.brightness).toBeGreaterThan(BASE.brightness);
     expect(happy.saturation).toBeGreaterThan(1);
     expect(happy.gammaMid).toBeGreaterThan(1);
-    expect(happy.lookBright).toBeGreaterThan(0);
+    expect(happy.lookHappy).toBeGreaterThan(0);
     expect(sad.temperature).toBeGreaterThan(0);
     expect(sad.brightness).toBeLessThan(BASE.brightness);
     expect(sad.saturation).toBeLessThan(1);
     expect(sad.gammaMid).toBeLessThan(1);
-    expect(relaxed.lookCalm).toBeGreaterThan(0);
+    expect(sad.lookSad).toBeGreaterThan(0);
+    expect(relaxed.lookRelaxed).toBeGreaterThan(0);
     expect(relaxed.contrast).toBeLessThan(BASE.contrast);
     expect(relaxed.bloom).toBeGreaterThan(0);
     expect(aggressive.contrast).toBeGreaterThan(BASE.contrast);
     expect(aggressive.grain).toBeGreaterThan(BASE.grain);
+    expect(aggressive.lookAggressive).toBeGreaterThan(0);
     [happy, sad, relaxed, aggressive].forEach(expectBounded);
   });
 
@@ -80,16 +83,18 @@ describe("AiFilterController", () => {
     expect(happy.brightness).toBeGreaterThan(1.02);
     expect(happy.temperature).toBeLessThan(-0.2);
     expect(happy.saturation).toBeGreaterThan(1.15);
-    expect(happy.lookBright).toBeGreaterThan(0.35);
+    expect(happy.lookHappy).toBeGreaterThan(0.35);
     expect(sad.brightness).toBeLessThan(0.88);
     expect(sad.temperature).toBeGreaterThan(0.2);
     expect(sad.saturation).toBeLessThan(0.85);
+    expect(sad.lookSad).toBeGreaterThan(0.35);
     expect(relaxed.contrast).toBeLessThan(1.0);
     expect(relaxed.bloom).toBeGreaterThan(0.12);
-    expect(relaxed.lookCalm).toBeGreaterThan(0.35);
+    expect(relaxed.lookRelaxed).toBeGreaterThan(0.35);
     expect(relaxed.gammaMid).toBeGreaterThan(1.05);
     expect(aggressive.contrast).toBeGreaterThan(1.24);
     expect(aggressive.grain).toBeGreaterThan(BASE.grain + 0.02);
+    expect(aggressive.lookAggressive).toBeGreaterThan(0.35);
     results.forEach(expectBounded);
   });
 
@@ -110,8 +115,8 @@ describe("AiFilterController", () => {
     const base = Object.freeze({ ...BASE });
     const mood = Object.freeze({ ...HAPPY, relaxed: 1 });
     const mixed = advance(new AiFilterController(), mood, "ai", base, params);
-    expect(mixed.lookBright).toBeGreaterThan(0.18);
-    expect(mixed.lookCalm).toBeGreaterThan(0.18);
+    expect(mixed.lookHappy).toBeGreaterThan(0.18);
+    expect(mixed.lookRelaxed).toBeGreaterThan(0.18);
     expect(mixed.lookDark).toBeGreaterThan(0.45);
     expect(mixed.lookDark).toBeLessThan(0.6);
     expectBounded(mixed);
@@ -130,12 +135,12 @@ describe("AiFilterController", () => {
     const controller = new AiFilterController();
     controller.update(BASE, DEFAULT_PARAMS, "default", null, 1 / 60);
     const first = { ...controller.update(BASE, DEFAULT_PARAMS, "ai", HAPPY, 1 / 60) };
-    expect(first.lookBright).toBeGreaterThan(0);
-    expect(first.lookBright).toBeLessThanOrEqual(0.18 / 60);
+    expect(first.lookHappy).toBeGreaterThan(0);
+    expect(first.lookHappy).toBeLessThanOrEqual(0.18 / 60);
     expect(first.brightness - BASE.brightness).toBeLessThanOrEqual(0.05 / 60 + 1e-12);
     const before = advance(controller, HAPPY);
     const next = controller.update(BASE, DEFAULT_PARAMS, "ai", SAD, 1 / 60);
-    expect(next.lookBright).toBeGreaterThan(0);
+    expect(next.lookSad).toBeGreaterThan(0);
     expect(Math.abs(next.temperature - before.temperature)).toBeLessThanOrEqual(0.16 / 60 + 1e-12);
   });
 
@@ -149,7 +154,7 @@ describe("AiFilterController", () => {
       expect(Math.abs(result.brightness - previous.brightness)).toBeLessThanOrEqual(0.05 / 60 + 1e-12);
       expect(Math.abs(result.contrast - previous.contrast)).toBeLessThanOrEqual(0.12 / 60 + 1e-12);
       expect(Math.abs(result.saturation - previous.saturation)).toBeLessThanOrEqual(0.12 / 60 + 1e-12);
-      for (const key of ["lookDark", "lookCalm", "lookBright"] as const) {
+      for (const key of ["lookDark", "lookCalm", "lookBright", "lookHappy", "lookSad", "lookRelaxed", "lookAggressive"] as const) {
         expect(Math.abs(result[key] - previous[key])).toBeLessThanOrEqual(0.18 / 60 + 1e-12);
       }
       previous = { ...result };
@@ -163,24 +168,24 @@ describe("AiFilterController", () => {
     const controller = new AiFilterController();
     const before = advance(controller, HAPPY, "ai", loudBase);
     const first = { ...controller.update(loudBase, DEFAULT_PARAMS, "ai", null, 1 / 60) };
-    expect(first.lookBright).toBeGreaterThan(0);
-    expect(first.lookBright).toBeLessThan(before.lookBright);
+    expect(first.lookHappy).toBeGreaterThan(0);
+    expect(first.lookHappy).toBeLessThan(before.lookHappy);
     const result = advance(controller, null, "ai", loudBase);
     for (const key of KEYS) expect(result[key]).toBeCloseTo(BASE[key], 5);
   });
 
-  it("uses only a small fraction of beat-driven contrast in AI mode", () => {
+  it("keeps a moderate share of beat-driven contrast breathing in AI mode", () => {
     const base = { ...BASE, contrast: BASE.contrast + 0.3 };
     const result = advance(new AiFilterController(), { happy: 0.5, sad: 0.5, relaxed: 0, aggressive: 0 }, "ai", base);
-    expect(result.contrast - BASE.contrast).toBeCloseTo(0.3 * 0.15, 6);
+    expect(result.contrast - BASE.contrast).toBeCloseTo(0.3 * 0.4, 6);
   });
 
   it("crossfades back to default, then restores exact default behavior", () => {
     const controller = new AiFilterController();
     const before = advance(controller, HAPPY);
     const first = { ...controller.update(BASE, DEFAULT_PARAMS, "default", null, 1 / 60) };
-    expect(first.lookBright).toBeGreaterThan(0);
-    expect(first.lookBright).toBeLessThan(before.lookBright);
+    expect(first.lookHappy).toBeGreaterThan(0);
+    expect(first.lookHappy).toBeLessThan(before.lookHappy);
     const restored = advance(controller, null, "default", BASE, DEFAULT_PARAMS, 120);
     expect(restored).toEqual(BASE);
     const changed = { ...BASE, contrast: 1.6 };
@@ -192,7 +197,7 @@ describe("AiFilterController", () => {
     advance(controller, HAPPY);
     const returning = advance(controller, null, "default", BASE, DEFAULT_PARAMS, 20);
     const reentered = controller.update(BASE, DEFAULT_PARAMS, "ai", RELAXED, 1 / 60);
-    expect(Math.abs(reentered.lookBright - returning.lookBright)).toBeLessThanOrEqual(0.18 / 60 + 1e-12);
+    expect(Math.abs(reentered.lookRelaxed - returning.lookRelaxed)).toBeLessThanOrEqual(0.18 / 60 + 1e-12);
     expectBounded(reentered);
   });
 

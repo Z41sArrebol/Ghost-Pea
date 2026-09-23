@@ -57,7 +57,7 @@ const audioReceivedRef = { get current() { return state.now; } };
 let pendingFrame: FrameRequestCallback | null = null;
 const happyRelaxed = (): AiMood => ({
   happy: 0.95, sad: 0.05, relaxed: 0.95, aggressive: 0.1,
-  rawHappy: 0.3, rawSad: 0.5, valence: 0.95, confidence: 0,
+  rawHappy: 0.3, rawSad: 0.5, rawRelaxed: 0.5, rawAggressive: 0.2, valence: 0.95, confidence: 0,
   streamEpoch: 1n, sequence: 1n, inferenceMs: 10, modelReady: true, silent: false, receivedAt: state.now,
 });
 function frame(seconds: number, refreshMood = true) {
@@ -104,8 +104,8 @@ describe("filter mode integration", () => {
     const canvas = document.querySelector("canvas.preview");
     selectMode("AI 模式");
     frame(8);
-    expect(uniforms().uLookBright).toBeGreaterThan(0.1);
-    expect(uniforms().uLookCalm).toBeGreaterThan(0.1);
+    expect(uniforms().uLookHappy).toBeGreaterThan(0.1);
+    expect(uniforms().uLookRelaxed).toBeGreaterThan(0.1);
     expect(uniforms().uTemperature).toBeLessThan(0);
     expect(uniforms().uSoftClip).toBe(1);
     expect(uniforms().uSaturation).toBeGreaterThan(1.05);
@@ -128,15 +128,15 @@ describe("filter mode integration", () => {
     const view = render(<App />);
     selectMode("AI 模式");
     frame(8);
-    expect(uniforms().uLookBright).toBeGreaterThan(0.1);
+    expect(uniforms().uLookHappy).toBeGreaterThan(0.1);
     if (reason === "silence") state.silence = true;
     if (reason === "stopped") state.running = false;
     if (reason === "failed") state.ready = false;
     view.rerender(<App />);
     frame(20, reason !== "expired");
     expect((screen.getByRole("radio", { name: "AI 模式" }) as HTMLInputElement).checked).toBe(true);
-    expect(uniforms().uLookBright).toBeCloseTo(0, 5);
-    expect(uniforms().uLookCalm).toBeCloseTo(0, 5);
+    expect(uniforms().uLookHappy).toBeCloseTo(0, 5);
+    expect(uniforms().uLookRelaxed).toBeCloseTo(0, 5);
     expect(uniforms().uTemperature).toBeCloseTo(0, 5);
     expect(uniforms().uBloom).toBeCloseTo(0, 5);
     expect(uniforms().uSaturation).toBeCloseTo(1, 5);

@@ -16,6 +16,10 @@ export interface RenderParameters {
   lookDark: number;
   lookCalm: number;
   lookBright: number;
+  lookHappy: number;
+  lookSad: number;
+  lookRelaxed: number;
+  lookAggressive: number;
   saturation: number;
   gammaMid: number;
 }
@@ -37,6 +41,10 @@ export const OUTPUT_LIMITS: Record<keyof RenderParameters, [number, number, numb
   lookDark: [0, 1],
   lookCalm: [0, 1],
   lookBright: [0, 1],
+  lookHappy: [0, 1],
+  lookSad: [0, 1],
+  lookRelaxed: [0, 1],
+  lookAggressive: [0, 1],
   saturation: [0.4, 1.8],
   gammaMid: [0.6, 1.6],
 };
@@ -157,6 +165,10 @@ export class ParameterOrchestrator {
       lookDark: p.lookDark,
       lookCalm: p.lookCalm,
       lookBright: p.lookBright,
+      lookHappy: 0,
+      lookSad: 0,
+      lookRelaxed: 0,
+      lookAggressive: 0,
       saturation: 1,
       gammaMid: 1,
     };

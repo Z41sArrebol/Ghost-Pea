@@ -6,7 +6,7 @@ import {
   type MoodResult,
 } from "../../packages/audio-ai/src";
 import { invoke, isTauri } from "@tauri-apps/api/core";
-import { calibrateHappySad } from "./moodCalibration";
+import { calibrateHappySad, calibrateRelaxedAggressive, DEFAULT_VALENCE_SENSITIVITY } from "./moodCalibration";
 
 export type MoodState = "calm" | "bright" | "intense" | "dark" | "neutral";
 export type DominantMood = "happy" | "sad" | "relaxed" | "aggressive";
@@ -15,6 +15,8 @@ export type AiMood = MoodResult["scores"] &
   Pick<MoodResult, "streamEpoch" | "sequence" | "confidence" | "inferenceMs" | "modelReady"> & {
     rawHappy: number;
     rawSad: number;
+    rawRelaxed: number;
+    rawAggressive: number;
     valence: number;
     silent: boolean;
     receivedAt: number;
@@ -24,7 +26,7 @@ type RawAiMood = MoodResult["scores"] &
 
 const HAPPY_VALENCE_THRESHOLD = 0.65;
 const SAD_VALENCE_THRESHOLD = 0.35;
-const AGGRESSIVE_THRESHOLD = 0.45;
+const AGGRESSIVE_THRESHOLD = 0.55;
 const RELAXED_THRESHOLD = 0.6;
 const AI_STALE_MS = 2500;
 const STALE_CHECK_MS = 1000;
@@ -90,7 +92,7 @@ export interface AiMoodHandle {
   selfTest: () => void;
 }
 
-export function useAiMood(valenceSensitivity = 24): AiMoodHandle {
+export function useAiMood(valenceSensitivity = DEFAULT_VALENCE_SENSITIVITY): AiMoodHandle {
   const serviceRef = useRef<AudioMoodService | null>(null);
   const lastMoodAtRef = useRef(0);
   const [rawMood, setRawMood] = useState<RawAiMood | null>(null);
@@ -167,17 +169,20 @@ export function useAiMood(valenceSensitivity = 24): AiMoodHandle {
         const calibrated = silent
           ? { happy: 0, sad: 0, valence: 0.5 }
           : calibrateHappySad(rawMood.happy, rawMood.sad, valenceSensitivity);
+        const arousal = calibrateRelaxedAggressive(rawMood.relaxed, rawMood.aggressive);
         const scores = {
           happy: calibrated.happy,
           sad: calibrated.sad,
-          relaxed: rawMood.relaxed,
-          aggressive: rawMood.aggressive,
+          relaxed: arousal.relaxed,
+          aggressive: arousal.aggressive,
         };
         return {
           ...rawMood,
           ...scores,
           rawHappy: rawMood.happy,
           rawSad: rawMood.sad,
+          rawRelaxed: rawMood.relaxed,
+          rawAggressive: rawMood.aggressive,
           valence: calibrated.valence,
           silent,
           confidence: getDominanceConfidence(scores),

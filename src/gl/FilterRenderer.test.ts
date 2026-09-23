@@ -369,6 +369,7 @@ function values(overrides: Partial<UniformValues> = {}): UniformValues {
     uTime: 0, uBypass: 0, uContrast: 1, uBrightness: 1, uTemperature: 0,
     uShadowCool: 0, uHighlightThr: 0.7, uVignette: 0, uGrain: 0,
     uBloom: 0.25, uBloomWarm: 0.15, uLookDark: 0.3, uLookCalm: 0.2, uLookBright: 0.1,
+    uLookHappy: 0, uLookSad: 0, uLookRelaxed: 0, uLookAggressive: 0,
     uSoftClip: 0, uSaturation: 1, uGammaMid: 1,
     ...overrides,
   };
@@ -426,7 +427,7 @@ describe("boundedSize", () => {
 });
 
 describe("FilterRenderer WebGL initialization and passes", () => {
-  it("uses real shader sources, unique handles, and three distinct RGBA8 3D LUTs", () => {
+  it("uses real shader sources, unique handles, and seven distinct RGBA8 3D LUTs", () => {
     const { renderer, canvas, mock, gl } = setup();
     expect(canvas.getContext).toHaveBeenCalledWith("webgl2", { antialias: false, alpha: false });
     expect(new Set(mock.created).size).toBe(mock.created.length);
@@ -438,12 +439,12 @@ describe("FilterRenderer WebGL initialization and passes", () => {
     expect(gl.deleteShader).toHaveBeenCalledTimes(8);
     expect(mock.live("shader")).toHaveLength(0);
     expect(mock.live("program")).toHaveLength(4);
-    expect(mock.live("texture")).toHaveLength(5);
+    expect(mock.live("texture")).toHaveLength(9);
     expect(gl.createFramebuffer).not.toHaveBeenCalled();
     const luts = mock.images.filter((image) => image.target === GL.TEXTURE_3D);
-    expect(luts).toHaveLength(3);
-    expect(new Set(luts.map((image) => image.texture)).size).toBe(3);
-    for (const [index, look] of (["dark", "calm", "bright"] as Look[]).entries()) {
+    expect(luts).toHaveLength(7);
+    expect(new Set(luts.map((image) => image.texture)).size).toBe(7);
+    for (const [index, look] of (["dark", "calm", "bright", "happy", "sad", "relaxed", "aggressive"] as Look[]).entries()) {
       const lut = luts[index];
       expect([lut.width, lut.height, lut.depth, lut.internalFormat, lut.flipY])
         .toEqual([LUT_SIZE, LUT_SIZE, LUT_SIZE, GL.RGBA8, false]);
@@ -456,7 +457,7 @@ describe("FilterRenderer WebGL initialization and passes", () => {
         expect([...data.slice(offset, offset + 4)]).toEqual([...expected, 255]);
       }
     }
-    expect(new Set(luts.map((lut) => [...(lut.data as Uint8Array).slice(0, 4)].join(","))).size).toBe(3);
+    expect(new Set(luts.map((lut) => [...(lut.data as Uint8Array).slice(0, 4)].join(","))).size).toBe(7);
     renderer.dispose();
     expectFreed(mock);
   });
@@ -527,8 +528,11 @@ describe("FilterRenderer WebGL initialization and passes", () => {
     const lutTextures = mock.images.filter((image) => image.target === GL.TEXTURE_3D).map((image) => image.texture);
     for (const draw of [highlight, composite]) {
       expect(draw.units.get("uTexture")).toBe(0);
-      for (const [index, name] of ["uDarkLut", "uCalmLut", "uBrightLut"].entries()) {
-        expect(draw.units.get(name)).toBe(index + 2);
+      for (const [index, [name, unit]] of ([
+        ["uDarkLut", 2], ["uCalmLut", 3], ["uBrightLut", 4],
+        ["uHappyLut", 7], ["uSadLut", 8], ["uRelaxedLut", 9], ["uAggressiveLut", 10],
+      ] as const).entries()) {
+        expect(draw.units.get(name)).toBe(unit);
         expect(draw.samples.get(name)).toBe(lutTextures[index]);
       }
     }
@@ -559,8 +563,8 @@ describe("FilterRenderer WebGL initialization and passes", () => {
       expect(targetStorage(mock)).toEqual(firstTargets);
     }
     expect(gl.createFramebuffer).toHaveBeenCalledTimes(6);
-    expect(gl.createTexture).toHaveBeenCalledTimes(11);
-    expect(gl.texImage3D).toHaveBeenCalledTimes(3);
+    expect(gl.createTexture).toHaveBeenCalledTimes(15);
+    expect(gl.texImage3D).toHaveBeenCalledTimes(7);
     expect(mock.subImages).toHaveLength(5);
   });
 
@@ -594,7 +598,7 @@ describe("FilterRenderer WebGL initialization and passes", () => {
     }
     expect(mock.images.filter((image) => !targets.includes(image.texture))).toEqual(initialNonTargets);
     expect(videoUploads(mock)).toHaveLength(1);
-    expect(mock.live("texture")).toHaveLength(11);
+    expect(mock.live("texture")).toHaveLength(15);
     expect(mock.live("framebuffer")).toHaveLength(6);
   });
 
@@ -692,6 +696,7 @@ describe("FilterRenderer partial initialization and bloom failure", () => {
     ["vao", 1], ["program", 1], ["program", 2], ["program", 3], ["program", 4],
     ["shader", 1], ["shader", 2], ["shader", 7], ["shader", 8],
     ["texture", 1], ["texture", 2], ["texture", 3], ["texture", 4], ["texture", 5],
+    ["texture", 6], ["texture", 7], ["texture", 8], ["texture", 9],
   ];
   it.each(allocationFailures)("frees partial initialization when %s allocation #%s returns null", (kind, at) => {
     const mock = createWebGLMock({ create: { kind, at } });
@@ -719,13 +724,13 @@ describe("FilterRenderer partial initialization and bloom failure", () => {
     const mock = createWebGLMock({ errorAt: 1 });
     const { canvas } = createCanvas(mock);
     expect(() => new FilterRenderer(canvas)).toThrow("初始化失败");
-    expect(mock.gl.texImage3D).toHaveBeenCalledTimes(3);
+    expect(mock.gl.texImage3D).toHaveBeenCalledTimes(7);
     expectFreed(mock);
   });
 
   const bloomFailures: [string, Faults][] = [
-    ["first texture allocation", { create: { kind: "texture", at: 6 } }],
-    ["last texture allocation", { create: { kind: "texture", at: 11 } }],
+    ["first texture allocation", { create: { kind: "texture", at: 10 } }],
+    ["last texture allocation", { create: { kind: "texture", at: 15 } }],
     ["first framebuffer allocation", { create: { kind: "framebuffer", at: 1 } }],
     ["last framebuffer allocation", { create: { kind: "framebuffer", at: 6 } }],
     ["first incomplete framebuffer", { framebufferStatusAt: 1 }],
@@ -842,7 +847,7 @@ describe("FilterRenderer video upload gating and callback lifecycle", () => {
     expect(new Set(uploads.map((image) => image.texture)).size).toBe(1);
     expect(uploads.every((image) => image.flipY)).toBe(true);
     expect(gl.pixelStorei).toHaveBeenLastCalledWith(GL.UNPACK_FLIP_Y_WEBGL, false);
-    expect(gl.createTexture).toHaveBeenCalledTimes(5);
+    expect(gl.createTexture).toHaveBeenCalledTimes(9);
   });
 
   it.each([
