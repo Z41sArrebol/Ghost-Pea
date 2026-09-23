@@ -146,6 +146,9 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
           uLookDark: p.lookDark,
           uLookCalm: p.lookCalm,
           uLookBright: p.lookBright,
+          uSoftClip: control.filterMode === "ai" ? 1 : 0,
+          uSaturation: p.saturation,
+          uGammaMid: p.gammaMid,
         };
         try {
           if (renderer.render(videoRef.current, uniforms, fitModeRef.current)) {

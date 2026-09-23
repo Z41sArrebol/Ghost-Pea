@@ -26,6 +26,9 @@ uniform float uHighlightThr;
 uniform float uLookDark;
 uniform float uLookCalm;
 uniform float uLookBright;
+uniform float uSoftClip;
+uniform float uSaturation;
+uniform float uGammaMid;
 in vec2 vUv;
 out vec4 outColor;
 
@@ -34,7 +37,12 @@ vec2 sourceUv() {
 }
 
 vec3 grade(vec3 source) {
-  vec3 c = clamp(((source - 0.5) * uContrast + 0.5) * uBrightness, 0.0, 1.0);
+  vec3 c = ((source - 0.5) * uContrast + 0.5) * uBrightness;
+  // AI 模式用高光肩部把 >0.75 的亮度平滑压向 1，提亮时保留高光层次；默认模式走原硬截断。
+  float knee = 0.75;
+  vec3 over = max(c - knee, 0.0);
+  vec3 shoulder = knee + over * (1.0 - knee) / ((1.0 - knee) + over);
+  c = mix(clamp(c, 0.0, 1.0), clamp(shoulder, 0.0, 1.0), step(knee, c) * uSoftClip);
   vec3 uvw = (c * ${LUT_SIZE - 1}.0 + 0.5) / ${LUT_SIZE}.0;
   float total = uLookDark + uLookCalm + uLookBright;
   c = c * max(0.0, 1.0 - total)
@@ -47,6 +55,10 @@ vec3 grade(vec3 source) {
   c *= temperature;
   float luminance = clamp(dot(c, vec3(0.299, 0.587, 0.114)), 0.0, 1.0);
   c = mix(c, c * vec3(0.85, 0.95, 1.15), (1.0 - luminance) * uShadowCool);
+  // 中间调 gamma 与饱和度（与 pixijs/filters adjustment 相同的公式），中性值 1 时无效果。
+  c = pow(max(c, 0.0), vec3(1.0 / uGammaMid));
+  float gray = dot(c, vec3(0.299, 0.587, 0.114));
+  c = mix(vec3(gray), c, uSaturation);
   return clamp(c, 0.0, 1.0);
 }
 `;
@@ -78,7 +90,9 @@ void main() {
 
 export const FRAGMENT_SHADER = `#version 300 es
 ${GRADE}
-uniform sampler2D uBloomTexture;
+uniform sampler2D uBloomTex0;
+uniform sampler2D uBloomTex1;
+uniform sampler2D uBloomTex2;
 uniform float uTime;
 uniform float uBypass;
 uniform float uVignette;
@@ -98,15 +112,32 @@ void main() {
   }
   vec3 c = grade(source);
   if (uBloom + uBloomWarm > 0.0) {
-    vec3 glow = texture(uBloomTexture, vUv).rgb;
+    // 三级多尺度柔光（结构参考 three.js UnrealBloomPass，MIT）：近处清晰光晕 + 远处宽扩散，权重归一。
+    vec3 glow = texture(uBloomTex0, vUv).rgb * 0.55
+      + texture(uBloomTex1, vUv).rgb * 0.30
+      + texture(uBloomTex2, vUv).rgb * 0.15;
     vec3 amount = clamp(glow * (uBloom * vec3(0.9, 0.95, 1.0)
       + uBloomWarm * vec3(0.6, 0.35, 0.15)), 0.0, 0.75);
     c = 1.0 - (1.0 - c) * (1.0 - amount);
   }
   float vignette = 1.0 - smoothstep(0.45, 0.85, distance(vUv, vec2(0.5)));
   c *= mix(1.0, vignette, uVignette);
-  float noise = hash(gl_FragCoord.xy + mod(floor(uTime * 30.0), 4096.0) * 17.0) - 0.5;
-  c += noise * uGrain;
+  // 胶片颗粒：2px 颗粒块按 24fps 跳变，暗部重、亮部轻（胶片特性），避免白色雪花感。
+  float frame = mod(floor(uTime * 24.0), 4096.0);
+  vec2 cell = floor(gl_FragCoord.xy * 0.5) + frame * vec2(17.0, 31.0);
+  float noise = hash(cell) - 0.5;
+  float response = 1.0 - smoothstep(0.35, 0.8, clamp(dot(c, vec3(0.299, 0.587, 0.114)), 0.0, 1.0)) * 0.75;
+  c += noise * uGrain * response;
   outColor = vec4(clamp(c, 0.0, 1.0), 1.0);
+}
+`;
+
+export const COPY_SHADER = `#version 300 es
+precision highp float;
+uniform sampler2D uTexture;
+in vec2 vUv;
+out vec4 outColor;
+void main() {
+  outColor = vec4(texture(uTexture, vUv).rgb, 1.0);
 }
 `;
