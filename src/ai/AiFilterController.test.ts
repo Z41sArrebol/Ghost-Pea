@@ -161,7 +161,7 @@ describe("AiFilterController", () => {
     }
   });
 
-  it("returns to the static style without replaying beats when AI input is unavailable", () => {
+  it("keeps bounded audio motion when AI input is unavailable", () => {
     const orchestrator = new ParameterOrchestrator(DEFAULT_PARAMS);
     for (let i = 0; i < 300; i++) orchestrator.update(DEFAULT_PARAMS, LOUD, true, 1 / 60);
     const loudBase = { ...orchestrator.update(DEFAULT_PARAMS, LOUD, true, 1 / 60) };
@@ -171,13 +171,28 @@ describe("AiFilterController", () => {
     expect(first.lookHappy).toBeGreaterThan(0);
     expect(first.lookHappy).toBeLessThan(before.lookHappy);
     const result = advance(controller, null, "ai", loudBase);
-    for (const key of KEYS) expect(result[key]).toBeCloseTo(BASE[key], 5);
+    expect(result.contrast).toBeGreaterThan(BASE.contrast);
+    expect(result.contrast - BASE.contrast).toBeLessThan(0.14);
+    expect(result.bloom).toBeGreaterThan(0);
+    expect(result.lookHappy).toBeCloseTo(0, 5);
+    const released = advance(controller, null, "ai", BASE);
+    for (const key of KEYS) expect(released[key]).toBeCloseTo(BASE[key], 8);
   });
 
-  it("keeps a moderate share of beat-driven contrast breathing in AI mode", () => {
+  it("soft-limits the fast contrast layer without delaying the mood transition", () => {
     const base = { ...BASE, contrast: BASE.contrast + 0.3 };
     const result = advance(new AiFilterController(), { happy: 0.5, sad: 0.5, relaxed: 0, aggressive: 0 }, "ai", base);
-    expect(result.contrast - BASE.contrast).toBeCloseTo(0.3 * 0.4, 6);
+    expect(result.contrast - BASE.contrast).toBeCloseTo(0.14 * Math.tanh(0.3 / 0.14), 6);
+    expect(result.contrast - BASE.contrast).toBeLessThan(0.14);
+  });
+
+  it("does not double the audio pulse on entry from default mode", () => {
+    const controller = new AiFilterController();
+    const loud = { ...BASE, contrast: BASE.contrast + 0.1, bloom: 0.12 };
+    controller.update(loud, DEFAULT_PARAMS, "default", null, 1 / 60);
+    const first = controller.update(loud, DEFAULT_PARAMS, "ai", null, 1 / 60);
+    expect(first.contrast).toBeLessThanOrEqual(loud.contrast + 1e-12);
+    expect(first.bloom).toBeLessThanOrEqual(loud.bloom + 1e-12);
   });
 
   it("crossfades back to default, then restores exact default behavior", () => {
@@ -190,6 +205,14 @@ describe("AiFilterController", () => {
     expect(restored).toEqual(BASE);
     const changed = { ...BASE, contrast: 1.6 };
     expect(controller.update(changed, DEFAULT_PARAMS, "default", HAPPY, 1 / 60)).toEqual(changed);
+  });
+
+  it("crossfades from the visible fast-layer frame when returning to default", () => {
+    const controller = new AiFilterController();
+    const loud = { ...BASE, contrast: BASE.contrast + 0.3 };
+    const before = advance(controller, HAPPY, "ai", loud);
+    const first = controller.update(BASE, DEFAULT_PARAMS, "default", null, 1 / 60);
+    expect(first.contrast).toBeCloseTo(before.contrast + (BASE.contrast - before.contrast) * (1 / 72) ** 2 * (3 - 2 / 72), 8);
   });
 
   it("can reenter AI during the return transition without restarting from a preset", () => {

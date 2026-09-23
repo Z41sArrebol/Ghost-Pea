@@ -1,4 +1,4 @@
-export type Look = "neutral" | "dark" | "calm" | "bright" | "happy" | "sad" | "relaxed" | "aggressive";
+export type Look = "neutral" | "dark" | "calm" | "bright" | "happy" | "sad" | "relaxed" | "aggressive" | "beat";
 export type Color = [number, number, number];
 export const LUT_SIZE = 32;
 
@@ -9,6 +9,9 @@ export function gradeColor(color: Color, look: Look): Color {
   const luminance = color[0] * 0.2126 + color[1] * 0.7152 + color[2] * 0.0722;
   const shadow = (1 - luminance) ** 2;
   const highlight = luminance ** 2;
+  if (look === "beat") {
+    return [clamp(color[0] + 0.045 * highlight), clamp(color[1] + 0.012 * highlight), clamp(color[2] - 0.025 * highlight)];
+  }
   const saturation = look === "calm" ? 0.84 : look === "bright" ? 1.12
     : look === "happy" ? 1.15 : look === "sad" ? 0.6
     : look === "relaxed" ? 0.9 : look === "aggressive" ? 0.8 : 0.92;

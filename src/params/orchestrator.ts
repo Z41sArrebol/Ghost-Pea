@@ -90,6 +90,12 @@ export class ParameterOrchestrator {
   private readonly targets: ParamValues;
   private readonly rendered: RenderParameters;
   private presence = 0;
+  private lastBassEnergy = 0;
+  private lastBassSequence = -1;
+  private bassPulseRelease = 0.25;
+  private bassPulseTarget = 0;
+  private bassPulseAttackRemaining = 0;
+  bassPulse = 0;
 
   constructor(initial: ParamValues) {
     this.params = parseParams(initial, DEFAULT_PARAMS);
@@ -133,6 +139,33 @@ export class ParameterOrchestrator {
     }
     // 频谱重心在静音时没有色温意义；独立释放门控，避免重心缓慢回落造成持续偏色。
     this.presence = smoothToward(this.presence, present ? 1 : 0, step, p.rmsAttack, p.rmsRelease);
+
+    const bassEnergy = present ? featureValue(features.bass, 0) * rmsToVisualLevel(features.rms) : 0;
+    let impulse = 0;
+    if (present && features.sequence !== this.lastBassSequence) {
+      const rise = Math.max(0, bassEnergy - this.lastBassEnergy);
+      if (rise > 0) {
+        impulse = Math.tanh(rise * 3);
+        if (impulse > this.bassPulseTarget || this.bassPulseAttackRemaining === 0 && impulse > this.bassPulse) {
+          this.bassPulseTarget = impulse;
+          this.bassPulseAttackRemaining = p.bassZoomAttack;
+          this.bassPulseRelease = 0.15 + 0.3 * impulse;
+        }
+      }
+      this.lastBassEnergy = bassEnergy;
+      this.lastBassSequence = features.sequence;
+    } else if (!present) {
+      this.lastBassEnergy = 0;
+      this.lastBassSequence = -1;
+    }
+    const attackStep = present ? Math.min(step, this.bassPulseAttackRemaining) : 0;
+    if (attackStep > 0) {
+      this.bassPulse = smoothToward(this.bassPulse, this.bassPulseTarget, attackStep, p.bassZoomAttack / 3, this.bassPulseRelease);
+      this.bassPulseAttackRemaining -= attackStep;
+    }
+    if (!present) this.bassPulseAttackRemaining = 0;
+    if (step > attackStep) this.bassPulse = smoothToward(this.bassPulse, 0, step - attackStep, p.bassZoomAttack, this.bassPulseRelease);
+    if (this.bassPulseAttackRemaining <= 0) this.bassPulseTarget = 0;
 
     const composed = this.compose();
     for (const key of OUTPUT_KEYS) {

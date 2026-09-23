@@ -123,7 +123,7 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
       const dt = Math.min(0.1, Math.max(0, (now - last) / 1000));
       last = now;
       const receivedAt = lastReceivedAtRef.current;
-      const available = receivedAt !== null && now - receivedAt <= AUDIO_STALE_MS;
+      const available = aiControlRef.current.running && receivedAt !== null && now - receivedAt <= AUDIO_STALE_MS;
       const base = orchestrator.update(paramsRef.current, featuresRef.current, available, dt);
       const control = aiControlRef.current;
       const audible = control.running && available && !featuresRef.current.silence
@@ -151,6 +151,15 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
           uLookSad: p.lookSad,
           uLookRelaxed: p.lookRelaxed,
           uLookAggressive: p.lookAggressive,
+          uLookBeat: available && !featuresRef.current.silence
+            ? orchestrator.params.mapOnsetLook * orchestrator.params.intensity * Math.tanh(orchestrator.features.onset * rmsToVisualLevel(orchestrator.features.rms) / 0.5)
+            : 0,
+          uBassTint: available && !featuresRef.current.silence
+            ? orchestrator.params.mapBassTint * orchestrator.params.intensity * Math.tanh(orchestrator.features.bass * rmsToVisualLevel(orchestrator.features.rms) * 2)
+            : 0,
+          uZoom: !bypassRef.current && available && orchestrator.params.bassZoomEnabled === 1
+            ? 1 + orchestrator.params.mapBassZoom * orchestrator.params.intensity * orchestrator.bassPulse
+            : 1,
           uSoftClip: control.filterMode === "ai" ? 1 : 0,
           uSaturation: p.saturation,
           uGammaMid: p.gammaMid,

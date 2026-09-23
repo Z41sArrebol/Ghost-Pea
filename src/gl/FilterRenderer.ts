@@ -5,7 +5,7 @@ const FLOAT_UNIFORMS = [
   "uTime", "uBypass", "uContrast", "uBrightness", "uTemperature", "uShadowCool",
   "uHighlightThr", "uVignette", "uGrain", "uBloom", "uBloomWarm",
   "uLookDark", "uLookCalm", "uLookBright", "uSoftClip", "uSaturation", "uGammaMid",
-  "uLookHappy", "uLookSad", "uLookRelaxed", "uLookAggressive",
+  "uLookHappy", "uLookSad", "uLookRelaxed", "uLookAggressive", "uLookBeat", "uBassTint", "uZoom",
 ] as const;
 
 export type UniformValues = Record<(typeof FLOAT_UNIFORMS)[number], number>;
@@ -14,7 +14,7 @@ export type FitMode = "cover" | "contain";
 // 三级多尺度柔光：1/4、1/8、1/16 分辨率，结构参考 three.js UnrealBloomPass（MIT）。
 const BLOOM_LEVELS = 3;
 const BLOOM_UNITS = [1, 5, 6] as const;
-// 三张主题 LUT 用 unit 2/3/4，四张情绪 LUT 用 unit 7-10（0 画面、1/5/6 柔光已占用）。
+// 三张主题 LUT 用 unit 2/3/4，四张情绪 LUT 用 7-10，鼓点 LUT 用 11（0 画面、1/5/6 柔光已占用）。
 const LUT_BINDINGS = [
   { look: "dark", name: "uDarkLut", unit: 2 },
   { look: "calm", name: "uCalmLut", unit: 3 },
@@ -23,6 +23,7 @@ const LUT_BINDINGS = [
   { look: "sad", name: "uSadLut", unit: 8 },
   { look: "relaxed", name: "uRelaxedLut", unit: 9 },
   { look: "aggressive", name: "uAggressiveLut", unit: 10 },
+  { look: "beat", name: "uBeatLut", unit: 11 },
 ] as const satisfies readonly { look: Look; name: string; unit: number }[];
 
 type Program = { handle: WebGLProgram; uniforms: Map<string, WebGLUniformLocation | null> };
@@ -69,6 +70,7 @@ export class FilterRenderer {
     if (!gl) throw new Error("当前环境不支持 WebGL2");
     this.gl = gl;
     try {
+      if (gl.getParameter(gl.MAX_TEXTURE_IMAGE_UNITS) < 12) throw new Error("显卡片元纹理单元不足，无法加载滤镜");
       this.vao = gl.createVertexArray();
       if (!this.vao) throw new Error("无法创建绘制资源");
       this.composite = this.createProgram(FRAGMENT_SHADER);

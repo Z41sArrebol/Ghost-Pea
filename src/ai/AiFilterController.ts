@@ -6,18 +6,20 @@ export type FilterMode = "default" | "ai";
 
 const KEYS = Object.keys(OUTPUT_LIMITS) as (keyof RenderParameters)[];
 const TRANSITION_SECONDS = 1.2;
+const FAST_LIMITS = { contrast: 0.14, grain: 0.03, bloom: 0.18, bloomWarm: 0.1 } as const;
+const FAST_KEYS = Object.keys(FAST_LIMITS) as (keyof typeof FAST_LIMITS)[];
 // 节拍驱动的参数（鼓点对比度、响度柔光、高频颗粒、低频暖光）多保留一些快层动态，
 // 情绪载体参数保持小比例，避免色温等被节拍抖动污染。
 const BASE_BLEND: Record<keyof RenderParameters, number> = {
-  contrast: 0.4,
+  contrast: 0,
   brightness: 0.15,
   temperature: 0.15,
   shadowCool: 0.15,
   highlightThr: 0.15,
   vignette: 0.15,
-  grain: 0.4,
-  bloom: 0.4,
-  bloomWarm: 0.4,
+  grain: 0,
+  bloom: 0,
+  bloomWarm: 0,
   lookDark: 0.15,
   lookCalm: 0.15,
   lookBright: 0.15,
@@ -107,6 +109,8 @@ function composeAiTarget(base: RenderParameters, params: ParamValues, mood: Mood
 
 export class AiFilterController {
   private rendered: RenderParameters | null = null;
+  private lastOutput: RenderParameters | null = null;
+  private readonly fast = { contrast: 0, grain: 0, bloom: 0, bloomWarm: 0 };
   private previousMode: FilterMode = "default";
   private returnFrom: RenderParameters | null = null;
   private returnProgress = 0;
@@ -118,13 +122,24 @@ export class AiFilterController {
     mood: MoodScores | null,
     dt: number,
   ): RenderParameters {
-    this.rendered ??= { ...base };
+    const wasInitialized = this.rendered !== null;
+    if (!this.rendered) {
+      this.rendered = { ...base };
+      if (mode === "ai") {
+        this.rendered.contrast = params.baseContrast;
+        this.rendered.grain = params.grainBase;
+        this.rendered.bloom = 0;
+        this.rendered.bloomWarm = 0;
+      }
+    }
     const step = Number.isFinite(dt) && dt > 0 ? Math.min(dt, 0.1) : 0;
     if (mode === "default") {
       if (this.previousMode === "ai") {
-        this.returnFrom = { ...this.rendered };
+        this.returnFrom = { ...(this.lastOutput ?? this.rendered) };
         this.returnProgress = 0;
       }
+      for (const key of FAST_KEYS) this.fast[key] = 0;
+      this.lastOutput = null;
       this.previousMode = mode;
       if (this.returnFrom) {
         this.returnProgress = Math.min(1, this.returnProgress + step / TRANSITION_SECONDS);
@@ -139,6 +154,15 @@ export class AiFilterController {
       return this.rendered;
     }
 
+    if (wasInitialized && this.previousMode === "default") {
+      for (const key of FAST_KEYS) {
+        const neutral = key === "contrast" ? params.baseContrast
+          : key === "grain" ? params.grainBase : 0;
+        const limit = FAST_LIMITS[key];
+        this.fast[key] = limit * Math.tanh((base[key] - neutral) / limit);
+        this.rendered[key] = Math.max(OUTPUT_LIMITS[key][0], this.rendered[key] - this.fast[key]);
+      }
+    }
     this.previousMode = mode;
     this.returnFrom = null;
     const target = composeAiTarget(base, params, mood);
@@ -164,6 +188,22 @@ export class AiFilterController {
       desired.bloomWarm = 0;
     }
     Object.assign(this.rendered, desired);
-    return this.rendered;
+    const output = { ...this.rendered };
+    for (const key of FAST_KEYS) {
+      const neutral = key === "contrast" ? params.baseContrast
+        : key === "grain" ? params.grainBase : 0;
+      const delta = base[key] - neutral;
+      const limit = FAST_LIMITS[key];
+      const bounded = limit * Math.tanh(delta / limit);
+      this.fast[key] = smoothToward(this.fast[key], bounded, step, 0.03, 0.16);
+      const [min, max] = OUTPUT_LIMITS[key];
+      output[key] = Math.max(min, Math.min(max, output[key] + this.fast[key]));
+    }
+    if (!params.bloomEnabled) {
+      output.bloom = 0;
+      output.bloomWarm = 0;
+    }
+    this.lastOutput = output;
+    return output;
   }
 }
