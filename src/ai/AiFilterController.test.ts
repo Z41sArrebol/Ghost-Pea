@@ -58,9 +58,13 @@ describe("AiFilterController", () => {
     const aggressive = advance(new AiFilterController(), AGGRESSIVE);
     expect(happy.temperature).toBeLessThan(0);
     expect(happy.brightness).toBeGreaterThan(BASE.brightness);
+    expect(happy.saturation).toBeGreaterThan(1);
+    expect(happy.gammaMid).toBeGreaterThan(1);
     expect(happy.lookBright).toBeGreaterThan(0);
     expect(sad.temperature).toBeGreaterThan(0);
     expect(sad.brightness).toBeLessThan(BASE.brightness);
+    expect(sad.saturation).toBeLessThan(1);
+    expect(sad.gammaMid).toBeLessThan(1);
     expect(relaxed.lookCalm).toBeGreaterThan(0);
     expect(relaxed.contrast).toBeLessThan(BASE.contrast);
     expect(relaxed.bloom).toBeGreaterThan(0);
@@ -73,16 +77,19 @@ describe("AiFilterController", () => {
     const results = [HAPPY, SAD, RELAXED, AGGRESSIVE].map(mood =>
       advance(new AiFilterController(), mood, "ai", BASE, DEFAULT_PARAMS, 300));
     const [happy, sad, relaxed, aggressive] = results;
-    expect(happy.brightness).toBeGreaterThan(1.2);
-    expect(happy.temperature).toBeLessThan(-0.65);
-    expect(happy.lookBright).toBeGreaterThan(0.65);
-    expect(sad.brightness).toBeLessThan(0.72);
-    expect(sad.temperature).toBeGreaterThan(0.65);
-    expect(relaxed.contrast).toBeLessThan(0.8);
-    expect(relaxed.bloom).toBeGreaterThan(0.28);
-    expect(relaxed.lookCalm).toBeGreaterThan(0.65);
-    expect(aggressive.contrast).toBeGreaterThan(1.6);
-    expect(aggressive.grain).toBeGreaterThan(0.1);
+    expect(happy.brightness).toBeGreaterThan(1.02);
+    expect(happy.temperature).toBeLessThan(-0.2);
+    expect(happy.saturation).toBeGreaterThan(1.15);
+    expect(happy.lookBright).toBeGreaterThan(0.35);
+    expect(sad.brightness).toBeLessThan(0.88);
+    expect(sad.temperature).toBeGreaterThan(0.2);
+    expect(sad.saturation).toBeLessThan(0.85);
+    expect(relaxed.contrast).toBeLessThan(1.0);
+    expect(relaxed.bloom).toBeGreaterThan(0.12);
+    expect(relaxed.lookCalm).toBeGreaterThan(0.35);
+    expect(relaxed.gammaMid).toBeGreaterThan(1.05);
+    expect(aggressive.contrast).toBeGreaterThan(1.24);
+    expect(aggressive.grain).toBeGreaterThan(BASE.grain + 0.02);
     results.forEach(expectBounded);
   });
 
@@ -103,10 +110,10 @@ describe("AiFilterController", () => {
     const base = Object.freeze({ ...BASE });
     const mood = Object.freeze({ ...HAPPY, relaxed: 1 });
     const mixed = advance(new AiFilterController(), mood, "ai", base, params);
-    expect(mixed.lookBright).toBeGreaterThan(0.35);
-    expect(mixed.lookCalm).toBeGreaterThan(0.35);
-    expect(mixed.lookDark).toBeGreaterThan(0.2);
-    expect(mixed.lookDark).toBeLessThan(0.3);
+    expect(mixed.lookBright).toBeGreaterThan(0.18);
+    expect(mixed.lookCalm).toBeGreaterThan(0.18);
+    expect(mixed.lookDark).toBeGreaterThan(0.45);
+    expect(mixed.lookDark).toBeLessThan(0.6);
     expectBounded(mixed);
     expect(params).toEqual(DEFAULT_PARAMS);
     expect(base).toEqual(BASE);
@@ -124,12 +131,12 @@ describe("AiFilterController", () => {
     controller.update(BASE, DEFAULT_PARAMS, "default", null, 1 / 60);
     const first = { ...controller.update(BASE, DEFAULT_PARAMS, "ai", HAPPY, 1 / 60) };
     expect(first.lookBright).toBeGreaterThan(0);
-    expect(first.lookBright).toBeLessThanOrEqual(0.3 / 60);
-    expect(first.brightness - BASE.brightness).toBeLessThanOrEqual(0.14 / 60 + 1e-12);
+    expect(first.lookBright).toBeLessThanOrEqual(0.18 / 60);
+    expect(first.brightness - BASE.brightness).toBeLessThanOrEqual(0.05 / 60 + 1e-12);
     const before = advance(controller, HAPPY);
     const next = controller.update(BASE, DEFAULT_PARAMS, "ai", SAD, 1 / 60);
     expect(next.lookBright).toBeGreaterThan(0);
-    expect(Math.abs(next.temperature - before.temperature)).toBeLessThanOrEqual(0.45 / 60 + 1e-12);
+    expect(Math.abs(next.temperature - before.temperature)).toBeLessThanOrEqual(0.16 / 60 + 1e-12);
   });
 
   it("keeps LUT sums and output bounds valid while rapidly alternating conflicting moods", () => {
@@ -139,10 +146,11 @@ describe("AiFilterController", () => {
       const mood = frame % 60 < 30 ? { ...HAPPY, relaxed: 1 } : { ...SAD, aggressive: 1 };
       const result = controller.update(BASE, DEFAULT_PARAMS, "ai", mood, 1 / 60);
       expectBounded(result);
-      expect(Math.abs(result.brightness - previous.brightness)).toBeLessThanOrEqual(0.14 / 60 + 1e-12);
-      expect(Math.abs(result.contrast - previous.contrast)).toBeLessThanOrEqual(0.3 / 60 + 1e-12);
+      expect(Math.abs(result.brightness - previous.brightness)).toBeLessThanOrEqual(0.05 / 60 + 1e-12);
+      expect(Math.abs(result.contrast - previous.contrast)).toBeLessThanOrEqual(0.12 / 60 + 1e-12);
+      expect(Math.abs(result.saturation - previous.saturation)).toBeLessThanOrEqual(0.12 / 60 + 1e-12);
       for (const key of ["lookDark", "lookCalm", "lookBright"] as const) {
-        expect(Math.abs(result[key] - previous[key])).toBeLessThanOrEqual(0.3 / 60 + 1e-12);
+        expect(Math.abs(result[key] - previous[key])).toBeLessThanOrEqual(0.18 / 60 + 1e-12);
       }
       previous = { ...result };
     }
@@ -184,7 +192,7 @@ describe("AiFilterController", () => {
     advance(controller, HAPPY);
     const returning = advance(controller, null, "default", BASE, DEFAULT_PARAMS, 20);
     const reentered = controller.update(BASE, DEFAULT_PARAMS, "ai", RELAXED, 1 / 60);
-    expect(Math.abs(reentered.lookBright - returning.lookBright)).toBeLessThanOrEqual(0.3 / 60 + 1e-12);
+    expect(Math.abs(reentered.lookBright - returning.lookBright)).toBeLessThanOrEqual(0.18 / 60 + 1e-12);
     expectBounded(reentered);
   });
 

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { boundedSize, FilterRenderer, type UniformValues } from "./FilterRenderer";
 import { gradeColor, LUT_SIZE, type Look } from "./luts";
-import { BLUR_SHADER, FRAGMENT_SHADER, HIGHLIGHT_SHADER, VERTEX_SHADER } from "./shaders";
+import { BLUR_SHADER, COPY_SHADER, FRAGMENT_SHADER, HIGHLIGHT_SHADER, VERTEX_SHADER } from "./shaders";
 
 // This stateful mock checks API contracts, not GLSL execution or GPU image quality.
 const GL = {
@@ -369,6 +369,7 @@ function values(overrides: Partial<UniformValues> = {}): UniformValues {
     uTime: 0, uBypass: 0, uContrast: 1, uBrightness: 1, uTemperature: 0,
     uShadowCool: 0, uHighlightThr: 0.7, uVignette: 0, uGrain: 0,
     uBloom: 0.25, uBloomWarm: 0.15, uLookDark: 0.3, uLookCalm: 0.2, uLookBright: 0.1,
+    uSoftClip: 0, uSaturation: 1, uGammaMid: 1,
     ...overrides,
   };
 }
@@ -431,12 +432,12 @@ describe("FilterRenderer WebGL initialization and passes", () => {
     expect(new Set(mock.created).size).toBe(mock.created.length);
     expect(mock.created.every((handle) => typeof handle === "object" && handle !== null)).toBe(true);
     expect([...mock.shaders.values()].filter((shader) => shader.type === GL.VERTEX_SHADER).map((shader) => shader.source))
-      .toEqual([VERTEX_SHADER, VERTEX_SHADER, VERTEX_SHADER]);
+      .toEqual([VERTEX_SHADER, VERTEX_SHADER, VERTEX_SHADER, VERTEX_SHADER]);
     expect([...mock.shaders.values()].filter((shader) => shader.type === GL.FRAGMENT_SHADER).map((shader) => shader.source))
-      .toEqual([FRAGMENT_SHADER, HIGHLIGHT_SHADER, BLUR_SHADER]);
-    expect(gl.deleteShader).toHaveBeenCalledTimes(6);
+      .toEqual([FRAGMENT_SHADER, HIGHLIGHT_SHADER, BLUR_SHADER, COPY_SHADER]);
+    expect(gl.deleteShader).toHaveBeenCalledTimes(8);
     expect(mock.live("shader")).toHaveLength(0);
-    expect(mock.live("program")).toHaveLength(3);
+    expect(mock.live("program")).toHaveLength(4);
     expect(mock.live("texture")).toHaveLength(5);
     expect(gl.createFramebuffer).not.toHaveBeenCalled();
     const luts = mock.images.filter((image) => image.target === GL.TEXTURE_3D);
@@ -486,26 +487,42 @@ describe("FilterRenderer WebGL initialization and passes", () => {
     ["cool only", { uBloom: 0.4, uBloomWarm: 0 }],
     ["warm only", { uBloom: 0, uBloomWarm: 0.4 }],
     ["mixed", { uBloom: 0.2, uBloomWarm: 0.3 }],
-  ] as const)("%s bloom has four feedback-free draws with distinct sampler types", (_label, overrides) => {
+  ] as const)("%s bloom blurs three mip levels in ten feedback-free draws", (_label, overrides) => {
     const { renderer, mock } = setup();
     expect(renderer.render(createVideo().video, values(overrides), "contain")).toBe(true);
-    expect(mock.draws).toHaveLength(4);
-    const [highlight, horizontal, vertical, composite] = mock.draws;
+    expect(mock.draws).toHaveLength(10);
+    const [highlight, h0, v0, copy1, h1, v1, copy2, h2, v2, composite] = mock.draws;
     const source = videoUploads(mock)[0].texture;
     expect(highlight.samples.get("uTexture")).toBe(source);
-    expect(highlight.attachment).not.toBe(horizontal.attachment);
-    expect(horizontal.samples.get("uTexture")).toBe(highlight.attachment);
-    expect(vertical.samples.get("uTexture")).toBe(horizontal.attachment);
-    expect(vertical.attachment).toBe(highlight.attachment);
+    expect(h0.samples.get("uTexture")).toBe(highlight.attachment);
+    expect(v0.samples.get("uTexture")).toBe(h0.attachment);
+    expect(v0.attachment).toBe(highlight.attachment);
+    expect(copy1.samples.get("uTexture")).toBe(highlight.attachment);
+    expect(h1.samples.get("uTexture")).toBe(copy1.attachment);
+    expect(v1.samples.get("uTexture")).toBe(h1.attachment);
+    expect(v1.attachment).toBe(copy1.attachment);
+    expect(copy2.samples.get("uTexture")).toBe(copy1.attachment);
+    expect(h2.samples.get("uTexture")).toBe(copy2.attachment);
+    expect(v2.samples.get("uTexture")).toBe(h2.attachment);
+    expect(v2.attachment).toBe(copy2.attachment);
     expect(composite.framebuffer).toBeNull();
     expect(composite.samples.get("uTexture")).toBe(source);
-    expect(composite.samples.get("uBloomTexture")).toBe(vertical.attachment);
-    expect(horizontal.uniforms.get("uDirection")).toEqual([1 / 320, 0]);
-    expect(vertical.uniforms.get("uDirection")).toEqual([0, 1 / 180]);
+    expect(composite.samples.get("uBloomTex0")).toBe(highlight.attachment);
+    expect(composite.samples.get("uBloomTex1")).toBe(copy1.attachment);
+    expect(composite.samples.get("uBloomTex2")).toBe(copy2.attachment);
+    expect(h0.uniforms.get("uDirection")).toEqual([1 / 320, 0]);
+    expect(v0.uniforms.get("uDirection")).toEqual([0, 1 / 180]);
+    expect(h1.uniforms.get("uDirection")).toEqual([1 / 160, 0]);
+    expect(v1.uniforms.get("uDirection")).toEqual([0, 1 / 90]);
+    expect(h2.uniforms.get("uDirection")).toEqual([1 / 80, 0]);
+    expect(v2.uniforms.get("uDirection")).toEqual([0, 1 / 45]);
     expect(composite.uniforms.get("uBloom")).toBe(overrides.uBloom);
     expect(composite.uniforms.get("uBloomWarm")).toBe(overrides.uBloomWarm);
     expect(mock.draws.map((draw) => draw.viewport)).toEqual([
-      [0, 0, 320, 180], [0, 0, 320, 180], [0, 0, 320, 180], [0, 0, 1280, 720],
+      [0, 0, 320, 180], [0, 0, 320, 180], [0, 0, 320, 180],
+      [0, 0, 160, 90], [0, 0, 160, 90], [0, 0, 160, 90],
+      [0, 0, 80, 45], [0, 0, 80, 45], [0, 0, 80, 45],
+      [0, 0, 1280, 720],
     ]);
     const lutTextures = mock.images.filter((image) => image.target === GL.TEXTURE_3D).map((image) => image.texture);
     for (const draw of [highlight, composite]) {
@@ -515,7 +532,9 @@ describe("FilterRenderer WebGL initialization and passes", () => {
         expect(draw.samples.get(name)).toBe(lutTextures[index]);
       }
     }
-    expect(composite.units.get("uBloomTexture")).toBe(1);
+    expect(composite.units.get("uBloomTex0")).toBe(1);
+    expect(composite.units.get("uBloomTex1")).toBe(5);
+    expect(composite.units.get("uBloomTex2")).toBe(6);
     for (const draw of mock.draws) {
       for (const texture of draw.samples.values()) expect(texture).not.toBe(draw.attachment);
     }
@@ -527,18 +546,20 @@ describe("FilterRenderer WebGL initialization and passes", () => {
     renderer.render(source.video, values(), "contain");
     const created = [...mock.created];
     const firstTargets = [...targetStorage(mock)];
-    expect(firstTargets).toHaveLength(2);
-    expect(firstTargets.map(({ width, height }) => [width, height])).toEqual([[320, 180], [320, 180]]);
+    expect(firstTargets).toHaveLength(6);
+    expect(firstTargets.map(({ width, height }) => [width, height])).toEqual([
+      [320, 180], [320, 180], [160, 90], [160, 90], [80, 45], [80, 45],
+    ]);
     for (let frame = 1; frame <= 5; frame++) {
       source.deliver(source.latestId(), frame);
       expect(renderer.render(source.video, values({ uTime: frame }), "contain")).toBe(true);
-      expect(mock.draws).toHaveLength((frame + 1) * 4);
-      expect(mock.draws.slice(-4).map((draw) => draw.framebuffer)).toEqual(mock.draws.slice(0, 4).map((draw) => draw.framebuffer));
+      expect(mock.draws).toHaveLength((frame + 1) * 10);
+      expect(mock.draws.slice(-10).map((draw) => draw.framebuffer)).toEqual(mock.draws.slice(0, 10).map((draw) => draw.framebuffer));
       expect(mock.created).toEqual(created);
       expect(targetStorage(mock)).toEqual(firstTargets);
     }
-    expect(gl.createFramebuffer).toHaveBeenCalledTimes(2);
-    expect(gl.createTexture).toHaveBeenCalledTimes(7);
+    expect(gl.createFramebuffer).toHaveBeenCalledTimes(6);
+    expect(gl.createTexture).toHaveBeenCalledTimes(11);
     expect(gl.texImage3D).toHaveBeenCalledTimes(3);
     expect(mock.subImages).toHaveLength(5);
   });
@@ -550,19 +571,22 @@ describe("FilterRenderer WebGL initialization and passes", () => {
     const created = [...mock.created];
     const targets = targetStorage(mock).map((image) => image.texture);
     const initialNonTargets = mock.images.filter((image) => !targets.includes(image.texture));
-    for (const [index, [width, height, targetWidth, targetHeight]] of [
-      [800, 600, 200, 150], [1920, 1080, 480, 270], [1280, 720, 320, 180],
+    for (const [index, [width, height, l0w, l0h, l1w, l1h, l2w, l2h]] of [
+      [800, 600, 200, 150, 100, 75, 50, 37], [1920, 1080, 480, 270, 240, 135, 120, 67], [1280, 720, 320, 180, 160, 90, 80, 45],
     ].entries()) {
+      const levelSizes = [[l0w, l0h], [l0w, l0h], [l1w, l1h], [l1w, l1h], [l2w, l2h], [l2w, l2h]];
       layout.width = width;
       layout.height = height;
       renderer.render(video, values(), "cover");
       expect(mock.created).toEqual(created);
-      expect(targetStorage(mock)).toHaveLength(2 * (index + 2));
-      expect(targetStorage(mock).slice(-2).map((image) => [image.texture, image.width, image.height]))
-        .toEqual(targets.map((texture) => [texture, targetWidth, targetHeight]));
-      expect(mock.draws.slice(-4).map((draw) => draw.viewport)).toEqual([
-        [0, 0, targetWidth, targetHeight], [0, 0, targetWidth, targetHeight],
-        [0, 0, targetWidth, targetHeight], [0, 0, width, height],
+      expect(targetStorage(mock)).toHaveLength(6 * (index + 2));
+      expect(targetStorage(mock).slice(-6).map((image) => [image.texture, image.width, image.height]))
+        .toEqual(targets.map((texture, level) => [texture, ...levelSizes[level]]));
+      expect(mock.draws.slice(-10).map((draw) => draw.viewport)).toEqual([
+        [0, 0, l0w, l0h], [0, 0, l0w, l0h], [0, 0, l0w, l0h],
+        [0, 0, l1w, l1h], [0, 0, l1w, l1h], [0, 0, l1w, l1h],
+        [0, 0, l2w, l2h], [0, 0, l2w, l2h], [0, 0, l2w, l2h],
+        [0, 0, width, height],
       ]);
       const count = mock.images.length;
       renderer.render(video, values(), "cover");
@@ -570,8 +594,8 @@ describe("FilterRenderer WebGL initialization and passes", () => {
     }
     expect(mock.images.filter((image) => !targets.includes(image.texture))).toEqual(initialNonTargets);
     expect(videoUploads(mock)).toHaveLength(1);
-    expect(mock.live("texture")).toHaveLength(7);
-    expect(mock.live("framebuffer")).toHaveLength(2);
+    expect(mock.live("texture")).toHaveLength(11);
+    expect(mock.live("framebuffer")).toHaveLength(6);
   });
 
   it("does not reallocate when layout changes but rounded bloom dimensions do not", () => {
@@ -583,7 +607,7 @@ describe("FilterRenderer WebGL initialization and passes", () => {
     layout.height = 721;
     renderer.render(video, values(), "cover");
     expect(mock.images).toHaveLength(count);
-    expect(mock.draws.slice(-4)[0].viewport).toEqual([0, 0, 320, 180]);
+    expect(mock.draws.slice(-10)[0].viewport).toEqual([0, 0, 320, 180]);
     expect(mock.draws[mock.draws.length - 1].viewport).toEqual([0, 0, 1281, 721]);
   });
 
@@ -592,20 +616,22 @@ describe("FilterRenderer WebGL initialization and passes", () => {
     const { video } = createVideo();
     renderer.render(video, values(), "contain");
     const created = [...mock.created];
-    const bloomTexture = mock.draws[3].samples.get("uBloomTexture");
+    const bloomTexture = mock.draws[9].samples.get("uBloomTex0");
     renderer.render(video, values({ uBypass: 1 }), "contain");
     renderer.render(video, values({ uBloom: 0, uBloomWarm: 0 }), "contain");
-    expect(mock.draws).toHaveLength(6);
-    for (const draw of mock.draws.slice(4)) {
+    expect(mock.draws).toHaveLength(12);
+    for (const draw of mock.draws.slice(10)) {
       expect(draw.framebuffer).toBeNull();
-      expect(draw.samples.get("uBloomTexture")).not.toBe(bloomTexture);
-      expect(mock.storage.get(draw.samples.get("uBloomTexture")!)!.data).toEqual(new Uint8Array([0, 0, 0, 255]));
+      for (const name of ["uBloomTex0", "uBloomTex1", "uBloomTex2"] as const) {
+        expect(draw.samples.get(name)).not.toBe(bloomTexture);
+        expect(mock.storage.get(draw.samples.get(name)!)!.data).toEqual(new Uint8Array([0, 0, 0, 255]));
+      }
     }
     renderer.render(video, values(), "contain");
-    expect(mock.draws).toHaveLength(10);
-    expect(mock.draws[9].samples.get("uBloomTexture")).toBe(bloomTexture);
+    expect(mock.draws).toHaveLength(22);
+    expect(mock.draws[21].samples.get("uBloomTex0")).toBe(bloomTexture);
     expect(mock.created).toEqual(created);
-    expect(targetStorage(mock)).toHaveLength(2);
+    expect(targetStorage(mock)).toHaveLength(6);
   });
 
   it.each([
@@ -617,7 +643,7 @@ describe("FilterRenderer WebGL initialization and passes", () => {
     Object.assign(layout, { width, height });
     renderer.render(createVideo().video, values(), fit);
     expect([canvas.width, canvas.height]).toEqual([outputWidth, outputHeight]);
-    for (const draw of [mock.draws[0], mock.draws[3]]) {
+    for (const draw of [mock.draws[0], mock.draws[9]]) {
       expect(draw.uniforms.get("uUvScaleX")).toBeCloseTo(x);
       expect(draw.uniforms.get("uUvScaleY")).toBeCloseTo(y);
     }
@@ -637,7 +663,7 @@ describe("FilterRenderer WebGL initialization and passes", () => {
     source.deliver(callback, 3, true);
     expect([gl.deleteShader, gl.deleteProgram, gl.deleteTexture, gl.deleteFramebuffer, gl.deleteVertexArray]
       .map((fn) => fn.mock.calls.length)).toEqual(deletes);
-    expect(mock.draws).toHaveLength(4);
+    expect(mock.draws).toHaveLength(10);
     expect(source.cancel).toHaveBeenCalledExactlyOnceWith(callback);
     expect(source.request).toHaveBeenCalledTimes(1);
   });
@@ -663,8 +689,8 @@ describe("FilterRenderer partial initialization and bloom failure", () => {
   });
 
   const allocationFailures: [Kind, number][] = [
-    ["vao", 1], ["program", 1], ["program", 2], ["program", 3],
-    ["shader", 1], ["shader", 2], ["shader", 5], ["shader", 6],
+    ["vao", 1], ["program", 1], ["program", 2], ["program", 3], ["program", 4],
+    ["shader", 1], ["shader", 2], ["shader", 7], ["shader", 8],
     ["texture", 1], ["texture", 2], ["texture", 3], ["texture", 4], ["texture", 5],
   ];
   it.each(allocationFailures)("frees partial initialization when %s allocation #%s returns null", (kind, at) => {
@@ -675,14 +701,14 @@ describe("FilterRenderer partial initialization and bloom failure", () => {
     expect(mock.draws).toEqual([]);
   });
 
-  it.each([1, 2, 3, 4, 5, 6])("frees all resources when shader compile #%s fails", (compileAt) => {
+  it.each([1, 2, 3, 4, 5, 6, 7, 8])("frees all resources when shader compile #%s fails", (compileAt) => {
     const mock = createWebGLMock({ compileAt });
     const { canvas } = createCanvas(mock);
     expect(() => new FilterRenderer(canvas)).toThrow("injected compile failure");
     expectFreed(mock);
   });
 
-  it.each([1, 2, 3])("frees shaders and programs when program link #%s fails", (linkAt) => {
+  it.each([1, 2, 3, 4])("frees shaders and programs when program link #%s fails", (linkAt) => {
     const mock = createWebGLMock({ linkAt });
     const { canvas } = createCanvas(mock);
     expect(() => new FilterRenderer(canvas)).toThrow("injected link failure");
@@ -699,11 +725,11 @@ describe("FilterRenderer partial initialization and bloom failure", () => {
 
   const bloomFailures: [string, Faults][] = [
     ["first texture allocation", { create: { kind: "texture", at: 6 } }],
-    ["second texture allocation", { create: { kind: "texture", at: 7 } }],
+    ["last texture allocation", { create: { kind: "texture", at: 11 } }],
     ["first framebuffer allocation", { create: { kind: "framebuffer", at: 1 } }],
-    ["second framebuffer allocation", { create: { kind: "framebuffer", at: 2 } }],
+    ["last framebuffer allocation", { create: { kind: "framebuffer", at: 6 } }],
     ["first incomplete framebuffer", { framebufferStatusAt: 1 }],
-    ["second incomplete framebuffer", { framebufferStatusAt: 2 }],
+    ["last incomplete framebuffer", { framebufferStatusAt: 6 }],
     ["target storage GL error", { errorAt: 2 }],
   ];
   it.each(bloomFailures)("falls back safely after %s and frees every allocation on disposal", (_label, fault) => {
@@ -717,9 +743,11 @@ describe("FilterRenderer partial initialization and bloom failure", () => {
     expect(draw.samples.get("uTexture")).toBe(videoUploads(mock)[0].texture);
     expect(draw.uniforms.get("uBloom")).toBe(0);
     expect(draw.uniforms.get("uBloomWarm")).toBe(0);
-    const empty = mock.storage.get(draw.samples.get("uBloomTexture")!)!;
-    expect([empty.width, empty.height]).toEqual([1, 1]);
-    expect(empty.data).toEqual(new Uint8Array([0, 0, 0, 255]));
+    for (const name of ["uBloomTex0", "uBloomTex1", "uBloomTex2"] as const) {
+      const empty = mock.storage.get(draw.samples.get(name)!)!;
+      expect([empty.width, empty.height]).toEqual([1, 1]);
+      expect(empty.data).toEqual(new Uint8Array([0, 0, 0, 255]));
+    }
     const allocations = [gl.createTexture.mock.calls.length, gl.createFramebuffer.mock.calls.length, mock.images.length];
     for (let frame = 0; frame < 3; frame++) expect(renderer.render(video, values(), "contain")).toBe(true);
     expect(mock.draws).toHaveLength(4);
@@ -742,12 +770,12 @@ describe("FilterRenderer partial initialization and bloom failure", () => {
     const { video } = createVideo();
     const baseTextures = [...mock.live("texture")];
     renderer.render(video, values(), "cover");
-    mock.faults.framebufferStatusAt = 3;
+    mock.faults.framebufferStatusAt = 7;
     Object.assign(layout, { width: 800, height: 600 });
     expect(renderer.render(video, values(), "cover")).toBe(true);
-    expect(mock.draws).toHaveLength(5);
-    expect(mock.draws[4].framebuffer).toBeNull();
-    expect(mock.draws[4].uniforms.get("uBloom")).toBe(0);
+    expect(mock.draws).toHaveLength(11);
+    expect(mock.draws[10].framebuffer).toBeNull();
+    expect(mock.draws[10].uniforms.get("uBloom")).toBe(0);
     expect(renderer.warning).not.toBeNull();
     expect.soft(mock.live("texture")).toEqual(baseTextures);
     expect.soft(mock.live("framebuffer")).toEqual([]);
@@ -773,7 +801,7 @@ describe("FilterRenderer video upload gating and callback lifecycle", () => {
     renderer.render(source.video, values(), "contain");
     expect(renderer.uploads).toBe(2);
     expect(mock.subImages).toHaveLength(1);
-    expect(mock.draws).toHaveLength(8);
+    expect(mock.draws).toHaveLength(20);
   });
 
   it("uploads once per dirty frame even when repeatedly rendering animated uniforms", () => {
@@ -792,7 +820,7 @@ describe("FilterRenderer video upload gating and callback lifecycle", () => {
     expect(videoUploads(mock)).toHaveLength(2);
     expect(mock.subImages).toHaveLength(1);
     expect(renderer.uploads).toBe(2);
-    expect(mock.draws).toHaveLength(36);
+    expect(mock.draws).toHaveLength(90);
     expect(source.pending.size).toBe(1);
   });
 
@@ -898,7 +926,7 @@ describe("FilterRenderer video upload gating and callback lifecycle", () => {
     source.state.readyState = 1;
     expect(renderer.render(source.video, values(), "contain")).toBe(false);
     expect(source.cancel).toHaveBeenCalledWith(oldId);
-    expect(mock.draws).toHaveLength(4);
+    expect(mock.draws).toHaveLength(10);
     expect(mock.clears).toEqual([null]);
     source.state.readyState = 2;
     expect(renderer.render(source.video, values(), "contain")).toBe(true);
@@ -921,7 +949,7 @@ describe("FilterRenderer video upload gating and callback lifecycle", () => {
     expect(source.cancel).toHaveBeenCalledTimes(1);
     expect(renderer.videoFrames).toBe(frames);
     expect(renderer.uploads).toBe(1);
-    expect(mock.draws).toHaveLength(4);
+    expect(mock.draws).toHaveLength(10);
     expectFreed(mock);
   });
 

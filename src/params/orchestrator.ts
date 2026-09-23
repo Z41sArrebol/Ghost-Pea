@@ -16,6 +16,8 @@ export interface RenderParameters {
   lookDark: number;
   lookCalm: number;
   lookBright: number;
+  saturation: number;
+  gammaMid: number;
 }
 
 const BASE_TAU = 0.2;
@@ -35,6 +37,8 @@ export const OUTPUT_LIMITS: Record<keyof RenderParameters, [number, number, numb
   lookDark: [0, 1],
   lookCalm: [0, 1],
   lookBright: [0, 1],
+  saturation: [0.4, 1.8],
+  gammaMid: [0.6, 1.6],
 };
 const OUTPUT_KEYS = Object.keys(OUTPUT_LIMITS) as (keyof RenderParameters)[];
 
@@ -153,6 +157,8 @@ export class ParameterOrchestrator {
       lookDark: p.lookDark,
       lookCalm: p.lookCalm,
       lookBright: p.lookBright,
+      saturation: 1,
+      gammaMid: 1,
     };
   }
 }

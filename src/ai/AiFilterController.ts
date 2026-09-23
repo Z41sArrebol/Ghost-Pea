@@ -7,18 +7,20 @@ export type FilterMode = "default" | "ai";
 const KEYS = Object.keys(OUTPUT_LIMITS) as (keyof RenderParameters)[];
 const TRANSITION_SECONDS = 1.2;
 const AI_RATES: Record<keyof RenderParameters, number> = {
-  contrast: 0.3,
-  brightness: 0.14,
-  temperature: 0.45,
-  shadowCool: 0.25,
-  highlightThr: 0.1,
-  vignette: 0.35,
-  grain: 0.045,
-  bloom: 0.2,
-  bloomWarm: 0.12,
-  lookDark: 0.3,
-  lookCalm: 0.3,
-  lookBright: 0.3,
+  contrast: 0.12,
+  brightness: 0.05,
+  temperature: 0.16,
+  shadowCool: 0.1,
+  highlightThr: 0.05,
+  vignette: 0.1,
+  grain: 0.012,
+  bloom: 0.08,
+  bloomWarm: 0.04,
+  lookDark: 0.18,
+  lookCalm: 0.18,
+  lookBright: 0.18,
+  saturation: 0.12,
+  gammaMid: 0.06,
 };
 
 function composeAiTarget(base: RenderParameters, params: ParamValues, mood: MoodScores | null): RenderParameters {
@@ -35,6 +37,8 @@ function composeAiTarget(base: RenderParameters, params: ParamValues, mood: Mood
     lookDark: params.lookDark,
     lookCalm: params.lookCalm,
     lookBright: params.lookBright,
+    saturation: 1,
+    gammaMid: 1,
   };
   if (!mood || [mood.happy, mood.sad, mood.relaxed, mood.aggressive].every((score) => score === 0)) return target;
 
@@ -45,19 +49,21 @@ function composeAiTarget(base: RenderParameters, params: ParamValues, mood: Mood
   const aggressive = Math.max(0, (mood.aggressive - 0.5) * 2);
   const amount = params.intensity;
 
-  target.contrast += amount * (0.18 * happy + 0.75 * aggressive - 0.15 * sad - 0.5 * relaxed);
-  target.brightness += amount * (0.38 * happy - 0.35 * sad + 0.12 * relaxed - 0.08 * aggressive);
+  target.contrast += amount * (0.06 * happy + 0.22 * aggressive - 0.06 * sad - 0.18 * relaxed);
+  target.brightness += amount * (0.12 * happy - 0.12 * sad + 0.05 * relaxed - 0.03 * aggressive);
   // The shader uses negative temperature for warm tones, positive for cool tones.
-  target.temperature += amount * (-0.9 * happy + 0.9 * sad + 0.45 * aggressive - 0.18 * relaxed);
-  target.shadowCool += amount * (0.45 * sad + 0.4 * aggressive - 0.5 * happy - 0.2 * relaxed);
-  target.vignette += amount * (0.1 * sad + 0.15 * aggressive - 0.9 * happy - 0.75 * relaxed);
-  target.grain += amount * (0.035 * sad + 0.12 * aggressive - 0.04 * relaxed - 0.025 * happy);
-  target.highlightThr -= amount * (0.1 * happy + 0.2 * relaxed);
-  target.bloom += params.bloomEnabled * amount * (0.18 * happy + 0.42 * relaxed + 0.035 * aggressive);
-  target.bloomWarm += params.bloomEnabled * amount * (0.2 * happy + 0.1 * relaxed);
+  target.temperature += amount * (-0.32 * happy + 0.32 * sad + 0.16 * aggressive - 0.06 * relaxed);
+  target.shadowCool += amount * (0.18 * sad + 0.15 * aggressive - 0.2 * happy - 0.08 * relaxed);
+  target.vignette += amount * (0.06 * sad + 0.08 * aggressive - 0.25 * happy - 0.2 * relaxed);
+  target.grain += amount * (0.012 * sad + 0.035 * aggressive - 0.012 * relaxed - 0.008 * happy);
+  target.highlightThr -= amount * (0.05 * happy + 0.1 * relaxed);
+  target.bloom += params.bloomEnabled * amount * (0.1 * happy + 0.2 * relaxed + 0.02 * aggressive);
+  target.bloomWarm += params.bloomEnabled * amount * (0.1 * happy + 0.05 * relaxed);
+  target.saturation += amount * (0.25 * happy + 0.15 * aggressive - 0.3 * sad - 0.1 * relaxed);
+  target.gammaMid += amount * (0.15 * happy + 0.1 * relaxed - 0.1 * sad - 0.05 * aggressive);
 
   // Cap the visual mixing budget, rather than treating independent scores as probabilities.
-  const budget = 0.95 * amount / Math.max(1, happy + sad + relaxed + aggressive);
+  const budget = 0.6 * amount / Math.max(1, happy + sad + relaxed + aggressive);
   const dark = (sad + aggressive * 0.8) * budget;
   const calm = relaxed * budget;
   const bright = happy * budget;

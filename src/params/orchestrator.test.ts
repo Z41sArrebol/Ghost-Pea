@@ -23,6 +23,7 @@ const BOUNDS: Record<keyof RenderParameters, [number, number]> = {
   shadowCool: [0, 1], highlightThr: [0.3, 0.9], vignette: [0, 1],
   grain: [0, 0.15], bloom: [0, 0.6], bloomWarm: [0, 0.35],
   lookDark: [0, 1], lookCalm: [0, 1], lookBright: [0, 1],
+  saturation: [0.4, 1.8], gammaMid: [0.6, 1.6],
 };
 
 function params(overrides: ParamValues = {}): ParamValues {
@@ -199,7 +200,7 @@ describe("ParameterOrchestrator", () => {
       contrast: initial.baseContrast, brightness: initial.brightness, temperature: 0,
       shadowCool: initial.shadowCool, highlightThr: initial.highlightThr, vignette: initial.vignette,
       grain: initial.grainBase, bloom: 0, bloomWarm: 0,
-      lookDark: 0, lookCalm: 1, lookBright: 0,
+      lookDark: 0, lookCalm: 1, lookBright: 0, saturation: 1, gammaMid: 1,
     });
     expect(orchestrator.params).not.toBe(initial);
   });

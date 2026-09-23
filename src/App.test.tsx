@@ -99,7 +99,7 @@ describe("filter mode integration", () => {
     render(<App />);
     frame(5);
     expect((screen.getByRole("radio", { name: "默认模式" }) as HTMLInputElement).checked).toBe(true);
-    expect(uniforms()).toMatchObject({ uLookDark: 1, uLookCalm: 0, uLookBright: 0, uTemperature: 0 });
+    expect(uniforms()).toMatchObject({ uLookDark: 1, uLookCalm: 0, uLookBright: 0, uTemperature: 0, uSoftClip: 0, uSaturation: 1, uGammaMid: 1 });
     const video = document.querySelector("video");
     const canvas = document.querySelector("canvas.preview");
     selectMode("AI 模式");
@@ -107,6 +107,9 @@ describe("filter mode integration", () => {
     expect(uniforms().uLookBright).toBeGreaterThan(0.1);
     expect(uniforms().uLookCalm).toBeGreaterThan(0.1);
     expect(uniforms().uTemperature).toBeLessThan(0);
+    expect(uniforms().uSoftClip).toBe(1);
+    expect(uniforms().uSaturation).toBeGreaterThan(1.05);
+    expect(uniforms().uGammaMid).toBeGreaterThan(1.1);
     expect(screen.getByRole("status").textContent).toContain("AI 混合氛围");
     expect(state.construct).toHaveBeenCalledTimes(1);
     expect(state.dispose).not.toHaveBeenCalled();
@@ -117,7 +120,7 @@ describe("filter mode integration", () => {
     expect(uniforms().uBypass).toBe(1);
     selectMode("默认模式");
     frame(2);
-    expect(uniforms()).toMatchObject({ uLookDark: 1, uLookCalm: 0, uLookBright: 0, uTemperature: 0 });
+    expect(uniforms()).toMatchObject({ uLookDark: 1, uLookCalm: 0, uLookBright: 0, uTemperature: 0, uSoftClip: 0, uSaturation: 1, uGammaMid: 1 });
     expect(state.construct).toHaveBeenCalledTimes(1);
   });
 
@@ -136,6 +139,8 @@ describe("filter mode integration", () => {
     expect(uniforms().uLookCalm).toBeCloseTo(0, 5);
     expect(uniforms().uTemperature).toBeCloseTo(0, 5);
     expect(uniforms().uBloom).toBeCloseTo(0, 5);
+    expect(uniforms().uSaturation).toBeCloseTo(1, 5);
+    expect(uniforms().uGammaMid).toBeCloseTo(1, 5);
     expect(state.construct).toHaveBeenCalledTimes(1);
   });
 });

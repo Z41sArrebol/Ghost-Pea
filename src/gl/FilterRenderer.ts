@@ -1,14 +1,18 @@
 import { createLut, LUT_SIZE, type Look } from "./luts";
-import { BLUR_SHADER, FRAGMENT_SHADER, HIGHLIGHT_SHADER, VERTEX_SHADER } from "./shaders";
+import { BLUR_SHADER, COPY_SHADER, FRAGMENT_SHADER, HIGHLIGHT_SHADER, VERTEX_SHADER } from "./shaders";
 
 const FLOAT_UNIFORMS = [
   "uTime", "uBypass", "uContrast", "uBrightness", "uTemperature", "uShadowCool",
   "uHighlightThr", "uVignette", "uGrain", "uBloom", "uBloomWarm",
-  "uLookDark", "uLookCalm", "uLookBright",
+  "uLookDark", "uLookCalm", "uLookBright", "uSoftClip", "uSaturation", "uGammaMid",
 ] as const;
 
 export type UniformValues = Record<(typeof FLOAT_UNIFORMS)[number], number>;
 export type FitMode = "cover" | "contain";
+
+// 三级多尺度柔光：1/4、1/8、1/16 分辨率，结构参考 three.js UnrealBloomPass（MIT）。
+const BLOOM_LEVELS = 3;
+const BLOOM_UNITS = [1, 5, 6] as const;
 
 type Program = { handle: WebGLProgram; uniforms: Map<string, WebGLUniformLocation | null> };
 type Target = { texture: WebGLTexture; framebuffer: WebGLFramebuffer };
@@ -30,8 +34,8 @@ export class FilterRenderer {
   private composite!: Program;
   private highlight!: Program;
   private blur!: Program;
-  private bloomWidth = 0;
-  private bloomHeight = 0;
+  private copy!: Program;
+  private bloomSizes: [number, number][] = [];
   private bloomFailed = false;
   private disposed = false;
   private video: HTMLVideoElement | null = null;
@@ -59,6 +63,7 @@ export class FilterRenderer {
       this.composite = this.createProgram(FRAGMENT_SHADER);
       this.highlight = this.createProgram(HIGHLIGHT_SHADER);
       this.blur = this.createProgram(BLUR_SHADER);
+      this.copy = this.createProgram(COPY_SHADER);
       this.source = this.createTexture2D();
       this.emptyBloom = this.createTexture2D();
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
@@ -99,7 +104,7 @@ export class FilterRenderer {
       }
       gl.linkProgram(handle);
       if (!gl.getProgramParameter(handle, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(handle) || "shader 链接失败");
-      const names = [...FLOAT_UNIFORMS, "uTexture", "uBloomTexture", "uDarkLut", "uCalmLut", "uBrightLut", "uUvScaleX", "uUvScaleY", "uDirection"];
+      const names = [...FLOAT_UNIFORMS, "uTexture", "uBloomTex0", "uBloomTex1", "uBloomTex2", "uDarkLut", "uCalmLut", "uBrightLut", "uUvScaleX", "uUvScaleY", "uDirection"];
       const program = { handle, uniforms: new Map(names.map((name) => [name, gl.getUniformLocation(handle, name)])) };
       this.programs.push(program);
       return program;
@@ -158,8 +163,12 @@ export class FilterRenderer {
   private prepareBloom(): void {
     const gl = this.gl;
     const [width, height] = boundedSize(Math.max(1, this.canvas.width / 4), Math.max(1, this.canvas.height / 4), 512, 131072);
-    if (width === this.bloomWidth && height === this.bloomHeight) return;
-    while (this.targets.length < 2) {
+    if (this.bloomSizes.length && width === this.bloomSizes[0][0] && height === this.bloomSizes[0][1]) return;
+    const sizes: [number, number][] = [];
+    for (let level = 0; level < BLOOM_LEVELS; level++) {
+      sizes.push([Math.max(1, Math.floor(width / 2 ** level)), Math.max(1, Math.floor(height / 2 ** level))]);
+    }
+    while (this.targets.length < BLOOM_LEVELS * 2) {
       const framebuffer = gl.createFramebuffer();
       if (!framebuffer) throw new Error("无法创建光晕缓冲");
       try {
@@ -169,16 +178,16 @@ export class FilterRenderer {
         throw error;
       }
     }
-    for (const target of this.targets) {
+    for (const [index, target] of this.targets.entries()) {
+      const [targetWidth, targetHeight] = sizes[Math.floor(index / 2)];
       gl.bindTexture(gl.TEXTURE_2D, target.texture);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, targetWidth, targetHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
       gl.bindFramebuffer(gl.FRAMEBUFFER, target.framebuffer);
       gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, target.texture, 0);
       if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error("光晕缓冲不可用");
     }
     if (gl.getError() !== gl.NO_ERROR) throw new Error("光晕缓冲分配失败");
-    this.bloomWidth = width;
-    this.bloomHeight = height;
+    this.bloomSizes = sizes;
   }
 
   private bindPass(program: Program, framebuffer: WebGLFramebuffer | null, width: number, height: number, texture: WebGLTexture): void {
@@ -246,7 +255,6 @@ export class FilterRenderer {
     const videoAspect = video.videoWidth / video.videoHeight;
     const scaleX = fit === "cover" ? Math.min(1, canvasAspect / videoAspect) : 1;
     const scaleY = fit === "cover" ? Math.min(1, videoAspect / canvasAspect) : 1;
-    let bloomTexture = this.emptyBloom;
     let bloomActive = values.uBypass < 0.5 && values.uBloom + values.uBloomWarm > 0.001 && !this.bloomFailed;
     if (bloomActive) {
       try {
@@ -265,25 +273,35 @@ export class FilterRenderer {
       }
     }
     if (bloomActive) {
-      const [a, b] = this.targets;
-      this.bindPass(this.highlight, a.framebuffer, this.bloomWidth, this.bloomHeight, this.source);
+      const [width, height] = this.bloomSizes[0];
+      this.bindPass(this.highlight, this.targets[0].framebuffer, width, height, this.source);
       this.setGrade(this.highlight, values, scaleX, scaleY);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
-      this.bindPass(this.blur, b.framebuffer, this.bloomWidth, this.bloomHeight, a.texture);
-      gl.uniform2f(this.blur.uniforms.get("uDirection") ?? null, 1 / this.bloomWidth, 0);
-      gl.drawArrays(gl.TRIANGLES, 0, 3);
-      this.bindPass(this.blur, a.framebuffer, this.bloomWidth, this.bloomHeight, b.texture);
-      gl.uniform2f(this.blur.uniforms.get("uDirection") ?? null, 0, 1 / this.bloomHeight);
-      gl.drawArrays(gl.TRIANGLES, 0, 3);
-      bloomTexture = a.texture;
+      for (let level = 0; level < BLOOM_LEVELS; level++) {
+        const [levelWidth, levelHeight] = this.bloomSizes[level];
+        const a = this.targets[level * 2];
+        const b = this.targets[level * 2 + 1];
+        if (level > 0) {
+          this.bindPass(this.copy, a.framebuffer, levelWidth, levelHeight, this.targets[(level - 1) * 2].texture);
+          gl.drawArrays(gl.TRIANGLES, 0, 3);
+        }
+        this.bindPass(this.blur, b.framebuffer, levelWidth, levelHeight, a.texture);
+        gl.uniform2f(this.blur.uniforms.get("uDirection") ?? null, 1 / levelWidth, 0);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        this.bindPass(this.blur, a.framebuffer, levelWidth, levelHeight, b.texture);
+        gl.uniform2f(this.blur.uniforms.get("uDirection") ?? null, 0, 1 / levelHeight);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+      }
     }
     this.bindPass(this.composite, null, this.canvas.width, this.canvas.height, this.source);
     this.setGrade(this.composite, values, scaleX, scaleY);
     gl.uniform1f(this.composite.uniforms.get("uBloom") ?? null, bloomActive ? values.uBloom : 0);
     gl.uniform1f(this.composite.uniforms.get("uBloomWarm") ?? null, bloomActive ? values.uBloomWarm : 0);
-    gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, bloomTexture);
-    gl.uniform1i(this.composite.uniforms.get("uBloomTexture") ?? null, 1);
+    for (const [level, unit] of BLOOM_UNITS.entries()) {
+      gl.activeTexture(gl.TEXTURE0 + unit);
+      gl.bindTexture(gl.TEXTURE_2D, bloomActive ? this.targets[level * 2].texture : this.emptyBloom);
+      gl.uniform1i(this.composite.uniforms.get(`uBloomTex${level}`) ?? null, unit);
+    }
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     return true;
   }
