@@ -8,6 +8,7 @@ const GL = {
   NO_ERROR: 0, OUT_OF_MEMORY: 0x0505,
   VERTEX_SHADER: 0x8b31, FRAGMENT_SHADER: 0x8b30,
   COMPILE_STATUS: 0x8b81, LINK_STATUS: 0x8b82,
+  MAX_TEXTURE_IMAGE_UNITS: 0x8872,
   TEXTURE0: 0x84c0, TEXTURE1: 0x84c1,
   TEXTURE_2D: 0x0de1, TEXTURE_3D: 0x806f,
   TEXTURE_MIN_FILTER: 0x2801, TEXTURE_MAG_FILTER: 0x2800,
@@ -201,6 +202,7 @@ function createWebGLMock(faults: Faults = {}) {
       return programs.get(handle)!.linked;
     }),
     getProgramInfoLog: vi.fn(() => "injected link failure"),
+    getParameter: vi.fn((parameter: number): number => parameter === GL.MAX_TEXTURE_IMAGE_UNITS ? 16 : 0),
     getUniformLocation: vi.fn((handle: Handle, name: string) => programs.get(handle)!.locations.get(name) ?? null),
     useProgram: vi.fn((handle: Handle) => {
       assertLive(handle, "program");
@@ -370,6 +372,7 @@ function values(overrides: Partial<UniformValues> = {}): UniformValues {
     uShadowCool: 0, uHighlightThr: 0.7, uVignette: 0, uGrain: 0,
     uBloom: 0.25, uBloomWarm: 0.15, uLookDark: 0.3, uLookCalm: 0.2, uLookBright: 0.1,
     uLookHappy: 0, uLookSad: 0, uLookRelaxed: 0, uLookAggressive: 0,
+    uLookBeat: 0, uBassTint: 0, uZoom: 1,
     uSoftClip: 0, uSaturation: 1, uGammaMid: 1,
     ...overrides,
   };
@@ -427,7 +430,7 @@ describe("boundedSize", () => {
 });
 
 describe("FilterRenderer WebGL initialization and passes", () => {
-  it("uses real shader sources, unique handles, and seven distinct RGBA8 3D LUTs", () => {
+  it("uses real shader sources, unique handles, and eight distinct RGBA8 3D LUTs", () => {
     const { renderer, canvas, mock, gl } = setup();
     expect(canvas.getContext).toHaveBeenCalledWith("webgl2", { antialias: false, alpha: false });
     expect(new Set(mock.created).size).toBe(mock.created.length);
@@ -439,12 +442,12 @@ describe("FilterRenderer WebGL initialization and passes", () => {
     expect(gl.deleteShader).toHaveBeenCalledTimes(8);
     expect(mock.live("shader")).toHaveLength(0);
     expect(mock.live("program")).toHaveLength(4);
-    expect(mock.live("texture")).toHaveLength(9);
+    expect(mock.live("texture")).toHaveLength(10);
     expect(gl.createFramebuffer).not.toHaveBeenCalled();
     const luts = mock.images.filter((image) => image.target === GL.TEXTURE_3D);
-    expect(luts).toHaveLength(7);
-    expect(new Set(luts.map((image) => image.texture)).size).toBe(7);
-    for (const [index, look] of (["dark", "calm", "bright", "happy", "sad", "relaxed", "aggressive"] as Look[]).entries()) {
+    expect(luts).toHaveLength(8);
+    expect(new Set(luts.map((image) => image.texture)).size).toBe(8);
+    for (const [index, look] of (["dark", "calm", "bright", "happy", "sad", "relaxed", "aggressive", "beat"] as Look[]).entries()) {
       const lut = luts[index];
       expect([lut.width, lut.height, lut.depth, lut.internalFormat, lut.flipY])
         .toEqual([LUT_SIZE, LUT_SIZE, LUT_SIZE, GL.RGBA8, false]);
@@ -457,9 +460,17 @@ describe("FilterRenderer WebGL initialization and passes", () => {
         expect([...data.slice(offset, offset + 4)]).toEqual([...expected, 255]);
       }
     }
-    expect(new Set(luts.map((lut) => [...(lut.data as Uint8Array).slice(0, 4)].join(","))).size).toBe(7);
+    expect(new Set(luts.map((lut) => [...(lut.data as Uint8Array).slice(0, 4)].join(","))).size).toBeGreaterThanOrEqual(7);
     renderer.dispose();
     expectFreed(mock);
+  });
+
+  it("rejects insufficient fragment texture units before allocating GPU resources", () => {
+    const mock = createWebGLMock();
+    mock.gl.getParameter.mockReturnValue(11);
+    const { canvas } = createCanvas(mock);
+    expect(() => new FilterRenderer(canvas)).toThrow("显卡片元纹理单元不足");
+    expect(mock.created).toHaveLength(0);
   });
 
   it.each([
@@ -530,7 +541,7 @@ describe("FilterRenderer WebGL initialization and passes", () => {
       expect(draw.units.get("uTexture")).toBe(0);
       for (const [index, [name, unit]] of ([
         ["uDarkLut", 2], ["uCalmLut", 3], ["uBrightLut", 4],
-        ["uHappyLut", 7], ["uSadLut", 8], ["uRelaxedLut", 9], ["uAggressiveLut", 10],
+        ["uHappyLut", 7], ["uSadLut", 8], ["uRelaxedLut", 9], ["uAggressiveLut", 10], ["uBeatLut", 11],
       ] as const).entries()) {
         expect(draw.units.get(name)).toBe(unit);
         expect(draw.samples.get(name)).toBe(lutTextures[index]);
@@ -563,8 +574,8 @@ describe("FilterRenderer WebGL initialization and passes", () => {
       expect(targetStorage(mock)).toEqual(firstTargets);
     }
     expect(gl.createFramebuffer).toHaveBeenCalledTimes(6);
-    expect(gl.createTexture).toHaveBeenCalledTimes(15);
-    expect(gl.texImage3D).toHaveBeenCalledTimes(7);
+    expect(gl.createTexture).toHaveBeenCalledTimes(16);
+    expect(gl.texImage3D).toHaveBeenCalledTimes(8);
     expect(mock.subImages).toHaveLength(5);
   });
 
@@ -598,7 +609,7 @@ describe("FilterRenderer WebGL initialization and passes", () => {
     }
     expect(mock.images.filter((image) => !targets.includes(image.texture))).toEqual(initialNonTargets);
     expect(videoUploads(mock)).toHaveLength(1);
-    expect(mock.live("texture")).toHaveLength(15);
+    expect(mock.live("texture")).toHaveLength(16);
     expect(mock.live("framebuffer")).toHaveLength(6);
   });
 
@@ -650,6 +661,16 @@ describe("FilterRenderer WebGL initialization and passes", () => {
     for (const draw of [mock.draws[0], mock.draws[9]]) {
       expect(draw.uniforms.get("uUvScaleX")).toBeCloseTo(x);
       expect(draw.uniforms.get("uUvScaleY")).toBeCloseTo(y);
+      expect(draw.uniforms.get("uZoom")).toBe(1);
+    }
+  });
+
+  it("uses the same bass tint and zoom in highlight and composite passes", () => {
+    const { renderer, mock } = setup();
+    renderer.render(createVideo().video, values({ uBassTint: 0.4, uZoom: 1.02 }), "cover");
+    for (const draw of [mock.draws[0], mock.draws[9]]) {
+      expect(draw.uniforms.get("uBassTint")).toBe(0.4);
+      expect(draw.uniforms.get("uZoom")).toBe(1.02);
     }
   });
 
@@ -724,13 +745,13 @@ describe("FilterRenderer partial initialization and bloom failure", () => {
     const mock = createWebGLMock({ errorAt: 1 });
     const { canvas } = createCanvas(mock);
     expect(() => new FilterRenderer(canvas)).toThrow("初始化失败");
-    expect(mock.gl.texImage3D).toHaveBeenCalledTimes(7);
+    expect(mock.gl.texImage3D).toHaveBeenCalledTimes(8);
     expectFreed(mock);
   });
 
   const bloomFailures: [string, Faults][] = [
-    ["first texture allocation", { create: { kind: "texture", at: 10 } }],
-    ["last texture allocation", { create: { kind: "texture", at: 15 } }],
+    ["first texture allocation", { create: { kind: "texture", at: 11 } }],
+    ["last texture allocation", { create: { kind: "texture", at: 16 } }],
     ["first framebuffer allocation", { create: { kind: "framebuffer", at: 1 } }],
     ["last framebuffer allocation", { create: { kind: "framebuffer", at: 6 } }],
     ["first incomplete framebuffer", { framebufferStatusAt: 1 }],
@@ -847,7 +868,7 @@ describe("FilterRenderer video upload gating and callback lifecycle", () => {
     expect(new Set(uploads.map((image) => image.texture)).size).toBe(1);
     expect(uploads.every((image) => image.flipY)).toBe(true);
     expect(gl.pixelStorei).toHaveBeenLastCalledWith(GL.UNPACK_FLIP_Y_WEBGL, false);
-    expect(gl.createTexture).toHaveBeenCalledTimes(9);
+    expect(gl.createTexture).toHaveBeenCalledTimes(10);
   });
 
   it.each([

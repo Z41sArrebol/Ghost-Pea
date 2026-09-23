@@ -5,7 +5,7 @@ const RELAXED_CENTER = 0.5;
 const AGGRESSIVE_CENTER = 0.3;
 const AROUSAL_GAIN = 2.5;
 // 默认灵敏度保持在 sigmoid 的线性区，歌曲内部的情绪波动能连续反映到滤镜，而不是被钉在 0/1 两端。
-export const DEFAULT_VALENCE_SENSITIVITY = 8;
+export const DEFAULT_VALENCE_SENSITIVITY = 24;
 
 export interface HappySadCalibration {
   happy: number;

@@ -20,8 +20,10 @@ uniform sampler3D uHappyLut;
 uniform sampler3D uSadLut;
 uniform sampler3D uRelaxedLut;
 uniform sampler3D uAggressiveLut;
+uniform sampler3D uBeatLut;
 uniform float uUvScaleX;
 uniform float uUvScaleY;
+uniform float uZoom;
 uniform float uContrast;
 uniform float uBrightness;
 uniform float uTemperature;
@@ -34,6 +36,8 @@ uniform float uLookHappy;
 uniform float uLookSad;
 uniform float uLookRelaxed;
 uniform float uLookAggressive;
+uniform float uLookBeat;
+uniform float uBassTint;
 uniform float uSoftClip;
 uniform float uSaturation;
 uniform float uGammaMid;
@@ -41,7 +45,7 @@ in vec2 vUv;
 out vec4 outColor;
 
 vec2 sourceUv() {
-  return (vUv - 0.5) * vec2(uUvScaleX, uUvScaleY) + 0.5;
+  return (vUv - 0.5) * vec2(uUvScaleX, uUvScaleY) / uZoom + 0.5;
 }
 
 vec3 grade(vec3 source) {
@@ -62,12 +66,15 @@ vec3 grade(vec3 source) {
     + texture(uSadLut, uvw).rgb * uLookSad
     + texture(uRelaxedLut, uvw).rgb * uLookRelaxed
     + texture(uAggressiveLut, uvw).rgb * uLookAggressive;
+  c = mix(c, texture(uBeatLut, (clamp(c, 0.0, 1.0) * ${LUT_SIZE - 1}.0 + 0.5) / ${LUT_SIZE}.0).rgb, uLookBeat);
   vec3 temperature = uTemperature < 0.0
     ? mix(vec3(1.0), vec3(1.08, 1.0, 0.9), -uTemperature)
     : mix(vec3(1.0), vec3(0.88, 0.97, 1.12), uTemperature);
   c *= temperature;
   float luminance = clamp(dot(c, vec3(0.299, 0.587, 0.114)), 0.0, 1.0);
   c = mix(c, c * vec3(0.85, 0.95, 1.15), (1.0 - luminance) * uShadowCool);
+  float midtone = 1.0 - abs(luminance * 2.0 - 1.0);
+  c = mix(c, clamp(c + vec3(0.13, 0.025, -0.075) * midtone, 0.0, 1.0), uBassTint);
   // 中间调 gamma 与饱和度（与 pixijs/filters adjustment 相同的公式），中性值 1 时无效果。
   c = pow(max(c, 0.0), vec3(1.0 / uGammaMid));
   float gray = dot(c, vec3(0.299, 0.587, 0.114));

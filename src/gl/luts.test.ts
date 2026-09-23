@@ -12,7 +12,7 @@ describe("built-in LUTs", () => {
     expect(gradeColor([0.2, 0.5, 0.7], "neutral")).toEqual([0.2, 0.5, 0.7]);
   });
 
-  it.each<Look>(["dark", "calm", "bright", "happy", "sad", "relaxed", "aggressive"])("creates finite bounded colors for %s", (look) => {
+  it.each<Look>(["dark", "calm", "bright", "happy", "sad", "relaxed", "aggressive", "beat"])("creates finite bounded colors for %s", (look) => {
     for (let r = 0; r <= 10; r++) for (let g = 0; g <= 10; g++) for (let b = 0; b <= 10; b++) {
       for (const value of gradeColor([r / 10, g / 10, b / 10], look)) {
         expect(Number.isFinite(value)).toBe(true);
@@ -25,6 +25,13 @@ describe("built-in LUTs", () => {
   it("gives the three themes distinct original color responses", () => {
     const colors = (["dark", "calm", "bright"] as Look[]).map((look) => gradeColor([0.2, 0.3, 0.4], look).join(","));
     expect(new Set(colors).size).toBe(3);
+  });
+
+  it("changes beat highlights gently while leaving black unchanged", () => {
+    expect(gradeColor([0, 0, 0], "beat")).toEqual([0, 0, 0]);
+    const bright = gradeColor([0.8, 0.8, 0.8], "beat");
+    expect(bright[0]).toBeGreaterThan(0.8);
+    expect(bright[2]).toBeLessThan(0.8);
   });
 
   it("gives the four moods clearly separated color identities across the tonal range", () => {

@@ -59,6 +59,43 @@ function expectRate(previous: RenderParameters, current: RenderParameters, dt: n
   }
 }
 
+describe("bass pulse", () => {
+  it("responds to rising low-frequency energy once per sample and falls back while sustained or silent", () => {
+    const orchestrator = new ParameterOrchestrator(DEFAULT_PARAMS);
+    const quiet = { ...LOUD, sequence: 1, rms: 0.2, bass: 0.1 };
+    advance(orchestrator, DEFAULT_PARAMS, quiet, true, 120);
+    const loud = { ...LOUD, sequence: 2, rms: 0.8, bass: 0.8 };
+    orchestrator.update(DEFAULT_PARAMS, loud, true, 1 / 60);
+    const peak = orchestrator.bassPulse;
+    expect(peak).toBeGreaterThan(0.1);
+    expect(peak).toBeLessThanOrEqual(1);
+    for (let frame = 0; frame < 60; frame++) orchestrator.update(DEFAULT_PARAMS, loud, true, 1 / 60);
+    expect(orchestrator.bassPulse).toBeLessThan(peak * 0.2);
+    const sustained = orchestrator.bassPulse;
+    orchestrator.update(DEFAULT_PARAMS, SILENT, true, 1 / 60);
+    expect(orchestrator.bassPulse).toBeLessThan(sustained);
+    advance(orchestrator, DEFAULT_PARAMS, SILENT, true, 120);
+    expect(orchestrator.bassPulse).toBeLessThan(0.002);
+  });
+
+  it("holds stronger rises longer and lets the user slow the attack", () => {
+    function pulse(rms: number, attack: number) {
+      const orchestrator = new ParameterOrchestrator(DEFAULT_PARAMS);
+      const target = params({ bassZoomAttack: attack });
+      orchestrator.update(target, { ...LOUD, sequence: 1, rms, bass: 0.8 }, true, 1 / 60);
+      const initial = orchestrator.bassPulse;
+      for (let frame = 0; frame < 24; frame++) {
+        orchestrator.update(target, { ...LOUD, sequence: 1, rms, bass: 0.8 }, true, 1 / 60);
+      }
+      return { initial, retained: orchestrator.bassPulse / initial };
+    }
+    expect(pulse(0.8, 0.2).initial).toBeLessThan(pulse(0.8, 0.01).initial);
+    expect(pulse(0.8, 0.03).retained).toBeGreaterThan(pulse(0.01, 0.03).retained);
+    expect(DEFAULT_PARAMS.bassZoomAttack).toBe(0.03);
+    expect(() => parseParams({ bassZoomAttack: 0 }, DEFAULT_PARAMS)).toThrow(/bassZoomAttack/);
+  });
+});
+
 describe("parseParams", () => {
   it("keeps omitted values, ignores unknown keys, and does not mutate either input", () => {
     const current = Object.freeze(params());
@@ -122,6 +159,12 @@ describe("schema and presets", () => {
     expect(Object.keys(DEFAULT_PARAMS).sort()).toEqual([...keys].sort());
     expect(parseParams(DEFAULT_PARAMS, DEFAULT_PARAMS)).toEqual(DEFAULT_PARAMS);
     expect(DEFAULT_PARAMS).toMatchObject({ bloomEnabled: 1, lookDark: 1, lookCalm: 0, lookBright: 0 });
+  });
+
+  it("keeps optional bass zoom disabled by default and validates its switch", () => {
+    expect(DEFAULT_PARAMS.bassZoomEnabled).toBe(0);
+    expect(parseParams({ bassZoomEnabled: 1 }, DEFAULT_PARAMS).bassZoomEnabled).toBe(1);
+    expect(() => parseParams({ bassZoomEnabled: 2 }, DEFAULT_PARAMS)).toThrow(/bassZoomEnabled/);
   });
 
   it("hides only the look sliders and exposes the numeric bloom switch", () => {
