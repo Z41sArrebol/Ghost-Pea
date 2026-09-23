@@ -2,7 +2,7 @@
 
 ## 1. 概述
 
-Rust 后端通过 Tauri Command 提供系统音频监听的启动、停止和状态查询接口，通过 Tauri Event 主动推送快速 DSP 特征，并通过二进制 Tauri Channel 发送 AI PCM 窗口。
+Rust 后端通过 Tauri Command 提供音频监听的启动、停止和状态查询接口，通过 Tauri Event 主动推送快速 DSP 特征，并通过二进制 Tauri Channel 发送 AI PCM 窗口。默认播放设备的 loopback 与默认麦克风分别采集，麦克风在启动时约 2 秒的底噪校准期间以低增益参与合流，此后使用保留最低增益的软门限。麦克风不可用时记录后端日志，并继续使用播放音频；当前不支持设备选择。
 
 - Command 用于生命周期控制和低频状态面板。
 - `audio-features` Event 用于 30–60 Hz 动态滤镜驱动。
@@ -85,8 +85,8 @@ export interface AiPcmStatus {
 | `running` | `boolean` | 音频监听是否处于运行状态 |
 | `state` | `AudioRuntimeState` | 监听生命周期状态，设备失效后为 `failed` |
 | `lastError` | `string \| null` | 已启动会话的运行期错误；无错误时为 `null` |
-| `sampleRateHz` | `number` | WASAPI 输出设备采样率，例如 `44100` 或 `48000` |
-| `channels` | `number` | WASAPI 输出设备原始通道数；进入 DSP 前会下混为单声道 |
+| `sampleRateHz` | `number` | WASAPI 播放设备采样率，也是混合后送入 DSP 的采样率，例如 `44100` 或 `48000` |
+| `channels` | `number` | WASAPI 播放设备原始通道数；进入 DSP 前会下混为单声道 |
 | `capturedFrames` | `number` | 本次监听启动以来累计读取的音频帧数 |
 | `droppedSamples` | `number` | RingBuffer 空间不足时未写入的单声道样本数 |
 | `sequence` | `number` | DSP 分析快照递增序号；事件限流时允许跳号，不允许倒退 |
@@ -228,7 +228,7 @@ console.log("audio started", status);
 
 行为说明：
 
-- 首次调用会创建 WASAPI 采集线程、DSP 线程和 AI PCM 线程，并等待设备初始化完成。AI PCM 默认禁用，线程仅低频休眠，不复制 PCM 或分配 3 秒滑窗。
+- 首次调用会创建播放设备和麦克风 WASAPI 采集线程、DSP 线程和 AI PCM 线程，并等待设备初始化完成。麦克风失败时退回播放音频。AI PCM 默认禁用，线程仅低频休眠，不复制 PCM 或分配 3 秒滑窗。
 - 如果监听已经运行，则不会重复创建线程，直接返回当前状态。
 - 如果上一次会话已进入 `failed`，调用本接口会先回收旧线程，再重新获取当前默认输出设备并创建新会话。
 - 启动失败时 Promise 被拒绝，错误值为后端返回的字符串。
@@ -323,14 +323,14 @@ console.log("audio stopped", finalStatus);
 
 行为说明：
 
-- 停止 WASAPI 采集线程、DSP 线程和 AI PCM 线程，并等待三个线程退出。
+- 停止播放设备和麦克风 WASAPI 采集线程、DSP 线程和 AI PCM 线程，并等待线程退出。
 - 返回停止后的最终统计，其中 `running` 为 `false`。
 - 如果监听尚未运行，返回全零默认状态。
 - 再次调用 `start_audio_monitor` 会创建新的监听会话，累计计数从零开始。
 
 ## 8. AI PCM Channel
 
-AI PCM 链路要求音频监听已经处于 `running`。它将设备单声道 PCM 重采样为 16 kHz，并发送固定 3 秒窗口；相邻窗口步长为 1 秒。
+AI PCM 链路要求音频监听已经处于 `running`。它将合流后的单声道 PCM 重采样为 16 kHz，并发送固定 3 秒窗口；相邻窗口步长为 1 秒。
 
 ### Commands
 
@@ -425,7 +425,7 @@ try {
 
 当前版本仅提供：
 
-- 默认 Windows 输出设备的 WASAPI Loopback 监听。
+- 默认 Windows 播放设备的 WASAPI Loopback 与默认麦克风采集；麦克风失败时回退到仅播放音频。
 - PCM 累计帧数和丢样统计。
 - RMS、Bass、Mid、Treble、Onset、Spectral Centroid、能量趋势和静音状态。
 - 最高 60 Hz 的 `audio-features` 主动事件。
@@ -436,6 +436,6 @@ try {
 当前尚未提供：
 
 - 音频设备选择。
-- 设备相关响度标定和自适应噪声底。
+- 设备相关响度标定和运行时自适应噪声底；当前仅在启动后的前 2 秒校准麦克风底噪。
 - 默认输出设备变化通知和自动重连；设备失效后需要前端重新调用 `start_audio_monitor`。
 - 前端模型推理、Web Worker 队列和 latest-only 调度。
