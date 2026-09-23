@@ -22,7 +22,14 @@ export class MoodRuntime {
   private models: TensorflowMusiCNN[] = [];
 
   async initialize(modelBaseUrl: string): Promise<void> {
+    try {
+      if (!(await tf.setBackend("webgl"))) throw new Error("WebGL backend is unavailable");
+    } catch (error) {
+      console.warn("AI WebGL backend unavailable; falling back to CPU", error);
+      await tf.setBackend("cpu");
+    }
     await tf.ready();
+    console.info("AI TensorFlow backend:", tf.getBackend());
     this.extractor = new EssentiaTFInputExtractor(EssentiaWASM, "musicnn");
     this.models = MOOD_MODELS.map(
       ({ directory }) => new TensorflowMusiCNN(tf, `${modelBaseUrl}/${directory}/model.json`),
