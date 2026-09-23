@@ -23,6 +23,10 @@ export interface AudioStatus {
   centroid: number;
   energyTrend: number;
   silence: boolean;
+  microphoneEnabled: boolean;
+  microphoneLevel: number;
+  microphoneGate: number;
+  microphoneGain: number;
 }
 
 export interface AudioFeatures {
@@ -48,6 +52,14 @@ export const AUDIO_STALE_MS = 1000;
 const STATUS_POLL_MS = 1000;
 const SIM_INTERVAL_MS = 33;
 
+/** 麦克风混音设置：gate = 0 表示自动校准底噪。 */
+export interface MicrophoneSettingsInput {
+  enabled: boolean;
+  gate: number;
+  gain: number;
+  recalibrate?: boolean;
+}
+
 export interface AudioFeaturesHandle {
   featuresRef: MutableRefObject<AudioFeatures>;
   lastReceivedAtRef: MutableRefObject<number | null>;
@@ -59,6 +71,8 @@ export interface AudioFeaturesHandle {
   stale: boolean;
   start: () => Promise<void>;
   stop: () => Promise<void>;
+  /** 热更新麦克风混音设置；浏览器预览（非 Tauri）下为无效操作。 */
+  setMicrophoneSettings: (settings: MicrophoneSettingsInput) => Promise<void>;
 }
 
 type Session = {
@@ -74,7 +88,7 @@ let backendOwner: Session | null = null;
 let statusPolling = false;
 function serialize(operation: () => Promise<void>): Promise<void> {
   const result = lifecycle.then(operation);
-  lifecycle = result.catch(() => {});
+  lifecycle = result.catch(() => { });
   return result;
 }
 
@@ -286,6 +300,24 @@ export function useAudioFeatures(): AudioFeaturesHandle {
     return result;
   }, [neutralize]);
 
+  const setMicrophoneSettings = useCallback(async (settings: MicrophoneSettingsInput) => {
+    if (!tauri) return;
+    try {
+      const status = await invoke<AudioStatus>("set_microphone_settings", {
+        enabled: settings.enabled,
+        gate: settings.gate,
+        gain: settings.gain,
+        recalibrate: settings.recalibrate ?? false,
+      });
+      const session = current.current;
+      if (session) applyStatus(session, status);
+    } catch (error) {
+      if (mounted.current) {
+        setView(previous => ({ ...previous, error: errorMessage(error) }));
+      }
+    }
+  }, [tauri, applyStatus]);
+
   useEffect(() => {
     mounted.current = true;
     return () => {
@@ -294,5 +326,5 @@ export function useAudioFeatures(): AudioFeaturesHandle {
     };
   }, [stop]);
 
-  return { featuresRef, lastReceivedAtRef, ...view, start, stop };
+  return { featuresRef, lastReceivedAtRef, ...view, start, stop, setMicrophoneSettings };
 }

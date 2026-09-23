@@ -36,7 +36,7 @@ vi.mock("./audio/useAudioFeatures", () => ({
     featuresRef: audioFeaturesRef,
     lastReceivedAtRef: audioReceivedRef,
     running: state.running, source: "tauri", status: null, busy: false, error: null, stale: false,
-    start: vi.fn(), stop: vi.fn(),
+    start: vi.fn(), stop: vi.fn(), setMicrophoneSettings: vi.fn(),
   }),
 }));
 vi.mock("./useCamera", () => ({ useCamera: () => ({ cameras: [], error: null, busy: false, retry: vi.fn() }) }));

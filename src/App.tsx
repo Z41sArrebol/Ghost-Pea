@@ -11,6 +11,7 @@ import {
   Select,
   Slider,
   Space,
+  Switch,
   Tabs,
   Tag,
   Typography,
@@ -30,13 +31,14 @@ import { useCamera, type CameraConfig } from "./useCamera";
 
 const STATUS_UPDATE_MS = 250;
 
-type FunctionKey = "filter" | "mapping" | "orchestrator" | "camera" | "ai" | "presets";
+type FunctionKey = "filter" | "mapping" | "orchestrator" | "camera" | "audio" | "ai" | "presets";
 
 const TAB_ITEMS: { key: FunctionKey; label: string }[] = [
   { key: "filter", label: "滤镜" },
   { key: "mapping", label: "映射" },
   { key: "orchestrator", label: "编排" },
   { key: "camera", label: "相机" },
+  { key: "audio", label: "音频" },
   { key: "ai", label: "AI" },
   { key: "presets", label: "预设" },
 ];
@@ -92,8 +94,11 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
   liveHintVisibleRef.current = liveHintVisible;
   const isFullscreenRef = useRef(false);
   isFullscreenRef.current = isFullscreen;
+  const [micSettings, setMicSettings] = useState({ enabled: true, gate: 0, gain: 1 });
+  const micSettingsRef = useRef(micSettings);
+  micSettingsRef.current = micSettings;
 
-  const { featuresRef, lastReceivedAtRef, running, source, status, busy: audioBusy, error: audioError, stale: audioStale, start, stop } = useAudioFeatures();
+  const { featuresRef, lastReceivedAtRef, running, source, status, busy: audioBusy, error: audioError, stale: audioStale, start, stop, setMicrophoneSettings } = useAudioFeatures();
   const {
     mood,
     moodLabel,
@@ -144,6 +149,21 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
     void applyWindowFullscreen(next);
     showLiveHint();
   }, [showLiveHint]);
+
+  const updateMicSettings = useCallback((patch: Partial<{ enabled: boolean; gate: number; gain: number }>) => {
+    const next = { ...micSettingsRef.current, ...patch };
+    micSettingsRef.current = next;
+    setMicSettings(next);
+    void setMicrophoneSettings(next);
+  }, [setMicrophoneSettings]);
+
+  const recalibrateMicrophone = useCallback(() => {
+    // 重新校准意味着回到自动门限，否则手动门限会继续生效、按钮看起来没反应。
+    const next = { ...micSettingsRef.current, gate: 0 };
+    micSettingsRef.current = next;
+    setMicSettings(next);
+    void setMicrophoneSettings({ ...next, recalibrate: true });
+  }, [setMicrophoneSettings]);
 
   // 直播模式：Esc 退出；F 切换全屏；鼠标滑动时短暂呼出提示
   useEffect(() => {
@@ -342,6 +362,15 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
     });
   }, []);
 
+  // 麦克风实时读数（后端未运行时显示占位符）
+  const microphoneLevelText = status ? (status.microphoneLevel ?? 0).toFixed(4) : "-";
+  const microphoneGateText = status ? (status.microphoneGate ?? 0).toFixed(4) : "-";
+  const microphoneStateText = !micSettings.enabled
+    ? "已静音"
+    : !status?.running
+      ? "未运行"
+      : (status.microphoneGain ?? 0) > 0.16 ? "打开" : "压住";
+
   const panelContent = () => {
     switch (activeFn) {
       case "filter":
@@ -379,6 +408,71 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
             </div>
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>
               修改后相机会重启视频流。
+            </Typography.Text>
+          </Space>
+        );
+      case "audio":
+        return (
+          <Space direction="vertical" size="medium" style={{ width: "100%" }}>
+            <div className="param-head">
+              <Typography.Text>麦克风参与混音</Typography.Text>
+              <Switch
+                aria-label="麦克风参与混音"
+                checked={micSettings.enabled}
+                onChange={(checked) => updateMicSettings({ enabled: checked })}
+              />
+            </div>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              关闭后麦克风完全不进入混音，只保留系统音频
+            </Typography.Text>
+            <div>
+              <div className="param-head">
+                <Typography.Text>底噪门限</Typography.Text>
+                <Typography.Text type="secondary">
+                  {micSettings.gate > 0 ? micSettings.gate.toFixed(3) : "自动校准"}
+                </Typography.Text>
+              </div>
+              <Slider
+                min={0}
+                max={0.2}
+                step={0.002}
+                value={micSettings.gate}
+                onChange={(value) => updateMicSettings({ gate: Array.isArray(value) ? value[0] : value })}
+              />
+            </div>
+            <div>
+              <div className="param-head">
+                <Typography.Text>麦克风增益</Typography.Text>
+                <Typography.Text type="secondary">{micSettings.gain.toFixed(2)}</Typography.Text>
+              </div>
+              <Slider
+                min={0}
+                max={1}
+                step={0.05}
+                value={micSettings.gain}
+                onChange={(value) => updateMicSettings({ gain: Array.isArray(value) ? value[0] : value })}
+              />
+            </div>
+            <Button long onClick={recalibrateMicrophone}>
+              重新自动校准底噪
+            </Button>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "minmax(96px, auto) minmax(0, 1fr)",
+                gap: "8px 16px",
+                fontVariantNumeric: "tabular-nums",
+              }}
+            >
+              <Typography.Text type="secondary">环境电平</Typography.Text>
+              <Typography.Text>{microphoneLevelText}</Typography.Text>
+              <Typography.Text type="secondary">当前门限</Typography.Text>
+              <Typography.Text>{microphoneGateText}</Typography.Text>
+              <Typography.Text type="secondary">门限状态</Typography.Text>
+              <Typography.Text>{microphoneStateText}</Typography.Text>
+            </div>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              自动校准以启动后约 2 秒的环境音为基准；低于门限的声音只按最低增益混入，避免底噪盖住音乐。改成手动门限后立即生效，不需要重启音频。
             </Typography.Text>
           </Space>
         );

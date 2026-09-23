@@ -20,7 +20,7 @@ use ai_pcm::SharedAiPcm;
 pub use ai_pcm::{AiPcmStatus, WindowSink};
 pub use metrics::DspPerformance;
 use metrics::{DspMetrics, SharedDspPerformance};
-use microphone_mix::MicrophoneMix;
+use microphone_mix::{MicrophoneMix, MicrophoneSettings};
 
 const CAPTURE_BUFFER_MILLIS: usize = 250;
 const MAX_AI_INPUT_SAMPLE_RATE_HZ: usize = 192_000;
@@ -77,6 +77,10 @@ pub struct AudioStatus {
     pub centroid: f32,
     pub energy_trend: f32,
     pub silence: bool,
+    pub microphone_enabled: bool,
+    pub microphone_level: f32,
+    pub microphone_gate: f32,
+    pub microphone_gain: f32,
 }
 
 struct SharedRuntime {
@@ -135,7 +139,7 @@ struct SharedStats {
 }
 
 impl SharedStats {
-    fn snapshot(&self, runtime: &SharedRuntime) -> AudioStatus {
+    fn snapshot(&self, runtime: &SharedRuntime, mic: &SharedMicFeedback) -> AudioStatus {
         let state = runtime.state();
         AudioStatus {
             running: state == AudioRuntimeState::Running,
@@ -155,6 +159,10 @@ impl SharedStats {
             centroid: f32::from_bits(self.centroid_bits.load(Ordering::Relaxed)),
             energy_trend: f32::from_bits(self.energy_trend_bits.load(Ordering::Relaxed)),
             silence: self.silence.load(Ordering::Relaxed),
+            microphone_enabled: mic.enabled.load(Ordering::Relaxed),
+            microphone_level: f32::from_bits(mic.level_bits.load(Ordering::Relaxed)),
+            microphone_gate: f32::from_bits(mic.gate_bits.load(Ordering::Relaxed)),
+            microphone_gain: f32::from_bits(mic.gain_bits.load(Ordering::Relaxed)),
         }
     }
 
@@ -177,6 +185,24 @@ impl SharedStats {
             .store(features.energy_trend.to_bits(), Ordering::Relaxed);
         self.silence.store(features.silence, Ordering::Relaxed);
         self.sequence.store(features.sequence, Ordering::Release);
+    }
+}
+
+/// 麦克风混音的实时读数，供状态快照读取（DSP 线程写入，命令线程读取）。
+#[derive(Default)]
+struct SharedMicFeedback {
+    enabled: AtomicBool,
+    level_bits: AtomicU32,
+    gate_bits: AtomicU32,
+    gain_bits: AtomicU32,
+}
+
+impl SharedMicFeedback {
+    fn publish(&self, enabled: bool, level: f32, gate: f32, gain: f32) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+        self.level_bits.store(level.to_bits(), Ordering::Relaxed);
+        self.gate_bits.store(gate.to_bits(), Ordering::Relaxed);
+        self.gain_bits.store(gain.to_bits(), Ordering::Relaxed);
     }
 }
 
@@ -207,12 +233,15 @@ struct RunningAudio {
     performance: Arc<SharedDspPerformance>,
     runtime: Arc<SharedRuntime>,
     ai_pcm: Arc<SharedAiPcm>,
+    microphone_feedback: Arc<SharedMicFeedback>,
 }
 
 #[derive(Default)]
 pub struct AudioMonitor {
     lifecycle: Mutex<()>,
     running: Mutex<Option<RunningAudio>>,
+    /// 麦克风混音设置：跨会话保留，前端可随时热更新。
+    microphone_settings: Arc<MicrophoneSettings>,
 }
 
 impl AudioMonitor {
@@ -229,7 +258,7 @@ impl AudioMonitor {
         if let Some(active) = running.as_ref() {
             match active.runtime.state() {
                 AudioRuntimeState::Starting | AudioRuntimeState::Running => {
-                    return Ok(active.stats.snapshot(&active.runtime));
+                    return Ok(active.stats.snapshot(&active.runtime, &active.microphone_feedback));
                 }
                 AudioRuntimeState::Stopping => {
                     return Err("audio monitor is stopping".into());
@@ -290,6 +319,9 @@ impl AudioMonitor {
         let dsp_runtime = Arc::clone(&runtime);
         let dsp_ai_pcm = Arc::clone(&ai_pcm);
         let dsp_microphone_stats = Arc::clone(&microphone_stats);
+        let microphone_feedback = Arc::new(SharedMicFeedback::default());
+        let dsp_microphone_feedback = Arc::clone(&microphone_feedback);
+        let dsp_microphone_settings = Arc::clone(&self.microphone_settings);
         let dsp_thread =
             match thread::Builder::new()
                 .name("ghost-pea-dsp".into())
@@ -299,6 +331,7 @@ impl AudioMonitor {
                             consumer,
                             microphone_consumer,
                             microphone_stats: dsp_microphone_stats,
+                            microphone_feedback: dsp_microphone_feedback,
                             ai_producer,
                             ai_pcm: dsp_ai_pcm,
                         },
@@ -306,6 +339,7 @@ impl AudioMonitor {
                         dsp_stats,
                         dsp_performance,
                         dsp_runtime,
+                        dsp_microphone_settings,
                         feature_sink,
                         performance_sink,
                     )
@@ -393,7 +427,7 @@ impl AudioMonitor {
                         None
                     }
                 };
-                let status = stats.snapshot(&runtime);
+                let status = stats.snapshot(&runtime, &microphone_feedback);
                 eprintln!(
                     "[audio] monitor started: {} Hz, {} channels",
                     status.sample_rate_hz, status.channels
@@ -410,6 +444,7 @@ impl AudioMonitor {
                     performance,
                     runtime,
                     ai_pcm,
+                    microphone_feedback,
                 });
                 Ok(status)
             }
@@ -466,7 +501,9 @@ impl AudioMonitor {
             .join()
             .map_err(|_| "AI PCM thread panicked")?;
         active.runtime.set_state(AudioRuntimeState::Stopped);
-        let status = active.stats.snapshot(&active.runtime);
+        let status = active
+            .stats
+            .snapshot(&active.runtime, &active.microphone_feedback);
         eprintln!(
             "[audio] monitor stopped: captured_frames={}, dropped_samples={}, mic_frames={}, mic_dropped={}",
             status.captured_frames,
@@ -480,9 +517,26 @@ impl AudioMonitor {
     pub fn status(&self) -> Result<AudioStatus, String> {
         let running = self.running.lock().map_err(|_| "audio state poisoned")?;
         Ok(match running.as_ref() {
-            Some(active) => active.stats.snapshot(&active.runtime),
+            Some(active) => active
+                .stats
+                .snapshot(&active.runtime, &active.microphone_feedback),
             None => AudioStatus::default(),
         })
+    }
+
+    /// 前端热更新麦克风混音设置；未运行时也会保存，下次启动生效。
+    pub fn set_microphone_settings(
+        &self,
+        enabled: bool,
+        gate: f32,
+        gain: f32,
+        recalibrate: bool,
+    ) -> Result<AudioStatus, String> {
+        self.microphone_settings.apply(enabled, gate, gain);
+        if recalibrate {
+            self.microphone_settings.request_calibration();
+        }
+        self.status()
     }
 
     pub fn performance_status(&self) -> Result<DspPerformance, String> {
@@ -701,6 +755,7 @@ struct DspChannels {
     consumer: CaptureConsumer,
     microphone_consumer: CaptureConsumer,
     microphone_stats: Arc<SharedStats>,
+    microphone_feedback: Arc<SharedMicFeedback>,
     ai_producer: CaptureProducer,
     ai_pcm: Arc<SharedAiPcm>,
 }
@@ -711,6 +766,7 @@ fn run_dsp(
     stats: Arc<SharedStats>,
     shared_performance: Arc<SharedDspPerformance>,
     runtime: Arc<SharedRuntime>,
+    microphone_settings: Arc<MicrophoneSettings>,
     feature_sink: FeatureSink,
     performance_sink: PerformanceSink,
 ) {
@@ -718,6 +774,7 @@ fn run_dsp(
         mut consumer,
         mut microphone_consumer,
         microphone_stats,
+        microphone_feedback,
         mut ai_producer,
         ai_pcm,
     } = channels;
@@ -754,22 +811,43 @@ fn run_dsp(
             thread::park_timeout(Duration::from_millis(2));
         } else if let (Some(analyzer), Some(metrics)) = (analyzer.as_mut(), metrics.as_mut()) {
             let microphone_rate = microphone_stats.sample_rate_hz.load(Ordering::Acquire) as u32;
+            let microphone_enabled = microphone_settings.enabled();
             if microphone_rate > 0 && microphone_mix.is_none() {
-                microphone_mix = Some(MicrophoneMix::new(microphone_rate, analyzer.sample_rate_hz));
+                microphone_mix = Some(MicrophoneMix::new(
+                    microphone_rate,
+                    analyzer.sample_rate_hz,
+                    Arc::clone(&microphone_settings),
+                ));
             }
             if microphone_rate == 0 {
                 microphone_mix = None;
                 microphone_consumer.skip(microphone_consumer.occupied_len());
             } else if let Some(mixer) = microphone_mix.as_mut() {
-                loop {
-                    let mic_count = microphone_consumer.pop_slice(&mut microphone_samples);
-                    if mic_count == 0 {
-                        break;
+                if microphone_enabled {
+                    loop {
+                        let mic_count = microphone_consumer.pop_slice(&mut microphone_samples);
+                        if mic_count == 0 {
+                            break;
+                        }
+                        mixer.push(&microphone_samples[..mic_count]);
                     }
-                    mixer.push(&microphone_samples[..mic_count]);
+                    mixer.mix(&mut samples[..count]);
+                } else {
+                    // 前端关闭了麦克风：丢弃采样不混入，系统音频不受影响
+                    microphone_consumer.skip(microphone_consumer.occupied_len());
                 }
-                mixer.mix(&mut samples[..count]);
             }
+            let (microphone_level, microphone_gate, microphone_gain) =
+                microphone_mix.as_ref().map_or(
+                    (0.0, microphone_settings.manual_gate(), 0.0),
+                    |mixer| (mixer.input_level(), mixer.current_gate(), mixer.current_gain()),
+                );
+            microphone_feedback.publish(
+                microphone_enabled,
+                microphone_level,
+                microphone_gate,
+                microphone_gain,
+            );
             let capture_drops = stats.dropped_samples.load(Ordering::Relaxed);
             if ai_pcm.is_enabled() {
                 if capture_drops > observed_capture_drops {
@@ -804,7 +882,7 @@ fn run_dsp(
         }
 
         if cfg!(debug_assertions) && last_report.elapsed() >= Duration::from_secs(1) {
-            let snapshot = stats.snapshot(&runtime);
+            let snapshot = stats.snapshot(&runtime, &microphone_feedback);
             let frames_per_second = snapshot.captured_frames - last_captured_frames;
             eprintln!(
                 "[audio] dsp: frames/s={}, seq={}, rms={:.5}, mic_level={:.5}, bands={:.3}/{:.3}/{:.3}, onset={:.3}, centroid={:.3}, trend={:.3}, silence={}, dropped={}, mic_dropped={}",
@@ -1096,13 +1174,17 @@ mod tests {
     fn runtime_failure_is_visible_in_status() {
         let stats = SharedStats::default();
         let runtime = SharedRuntime::new();
-        assert_eq!(stats.snapshot(&runtime).state, AudioRuntimeState::Starting);
+        let mic = SharedMicFeedback::default();
+        assert_eq!(
+            stats.snapshot(&runtime, &mic).state,
+            AudioRuntimeState::Starting
+        );
 
         runtime.set_state(AudioRuntimeState::Running);
-        assert!(stats.snapshot(&runtime).running);
+        assert!(stats.snapshot(&runtime, &mic).running);
 
         runtime.fail("device invalidated".into());
-        let status = stats.snapshot(&runtime);
+        let status = stats.snapshot(&runtime, &mic);
         assert!(!status.running);
         assert_eq!(status.state, AudioRuntimeState::Failed);
         assert_eq!(status.last_error.as_deref(), Some("device invalidated"));
