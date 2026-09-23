@@ -142,8 +142,8 @@ describe("filter mode integration", () => {
     fireEvent.click(screen.getByText("映射"));
     frame(1);
     const before = { ...uniforms() };
-    fireEvent.keyDown(screen.getByRole("slider", { name: "鼓点 → LUT 调色" }), { key: "ArrowRight" });
-    fireEvent.keyDown(screen.getByRole("slider", { name: "低频 → 中间调暖色" }), { key: "ArrowRight" });
+    fireEvent.keyDown(screen.getByRole("slider", { name: "鼓点 → LUT 调色" }), { key: "ArrowRight", keyCode: 39 });
+    fireEvent.keyDown(screen.getByRole("slider", { name: "低频 → 中间调暖色" }), { key: "ArrowRight", keyCode: 39 });
     frame(1);
     expect(uniforms().uLookBeat).toBeGreaterThan(before.uLookBeat);
     expect(uniforms().uBassTint).toBeGreaterThan(before.uBassTint);
@@ -155,7 +155,7 @@ describe("filter mode integration", () => {
     const zoomBefore = uniforms().uZoom;
     fireEvent.click(screen.getByText("映射"));
     const zoomSlider = screen.getByRole("slider", { name: "低频 → 镜头呼吸幅度" });
-    fireEvent.keyDown(zoomSlider, { key: "ArrowLeft" });
+    fireEvent.keyDown(zoomSlider, { key: "ArrowLeft", keyCode: 37 });
     expect(Number(zoomSlider.getAttribute("aria-valuenow"))).toBeLessThan(0.4);
     frame(2);
     expect(uniforms().uZoom).toBeLessThan(zoomBefore);
