@@ -103,6 +103,19 @@ afterEach(() => {
 });
 
 describe("filter mode integration", () => {
+  it("enters live mode for OBS capture and exits with Escape", () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "直播模式" }));
+    expect(document.querySelector(".page")?.className).toContain("live");
+    expect(screen.getByText(/直播模式 · 按/)).toBeTruthy();
+    // F 只切换全屏，不退出直播模式
+    fireEvent.keyDown(window, { key: "f" });
+    expect(screen.getByRole("button", { name: /退出全屏/ })).toBeTruthy();
+    expect(document.querySelector(".page")?.className).toContain("live");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(document.querySelector(".page")?.className).not.toContain("live");
+  });
+
   it("keeps bass tint active while optional zoom follows only low-frequency rises", () => {
     state.mood = null;
     render(<App />);
