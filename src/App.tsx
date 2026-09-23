@@ -17,6 +17,7 @@ import {
 } from "@arco-design/web-react";
 import { IconMoon, IconSun } from "@arco-design/web-react/icon";
 import { AiFilterController, type FilterMode } from "./ai/AiFilterController";
+import { DEFAULT_VALENCE_SENSITIVITY } from "./ai/moodCalibration";
 import { getActiveAiMood, useAiMood } from "./ai/useAiMood";
 import { AUDIO_STALE_MS, useAudioFeatures } from "./audio/useAudioFeatures";
 import { ParamSliders } from "./components/ParamSliders";
@@ -55,7 +56,7 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
   const [activeFn, setActiveFn] = useState<FunctionKey>("filter");
   const [frameStats, setFrameStats] = useState({ render: 0, video: 0, p95: 0 });
   const [meter, setMeter] = useState({ rms: 0, bass: 0, treble: 0, onset: 0, centroid: 0.5 });
-  const [valenceSensitivity, setValenceSensitivity] = useState(24);
+  const [valenceSensitivity, setValenceSensitivity] = useState(DEFAULT_VALENCE_SENSITIVITY);
 
   const { featuresRef, lastReceivedAtRef, running, source, status, busy: audioBusy, error: audioError, stale: audioStale, start, stop } = useAudioFeatures();
   const {
@@ -146,6 +147,10 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
           uLookDark: p.lookDark,
           uLookCalm: p.lookCalm,
           uLookBright: p.lookBright,
+          uLookHappy: p.lookHappy,
+          uLookSad: p.lookSad,
+          uLookRelaxed: p.lookRelaxed,
+          uLookAggressive: p.lookAggressive,
           uSoftClip: control.filterMode === "ai" ? 1 : 0,
           uSaturation: p.saturation,
           uGammaMid: p.gammaMid,
@@ -335,14 +340,18 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
               <Typography.Text>{mood ? mood.happy.toFixed(4) : "-"}</Typography.Text>
               <Typography.Text type="secondary">Sad（转换）</Typography.Text>
               <Typography.Text>{mood ? mood.sad.toFixed(4) : "-"}</Typography.Text>
+              <Typography.Text type="secondary">Relaxed（转换）</Typography.Text>
+              <Typography.Text>{mood ? mood.relaxed.toFixed(4) : "-"}</Typography.Text>
+              <Typography.Text type="secondary">Aggressive（转换）</Typography.Text>
+              <Typography.Text>{mood ? mood.aggressive.toFixed(4) : "-"}</Typography.Text>
               <Typography.Text type="secondary">Happy（原始）</Typography.Text>
               <Typography.Text>{mood ? mood.rawHappy.toFixed(4) : "-"}</Typography.Text>
               <Typography.Text type="secondary">Sad（原始）</Typography.Text>
               <Typography.Text>{mood ? mood.rawSad.toFixed(4) : "-"}</Typography.Text>
-              <Typography.Text type="secondary">Relaxed</Typography.Text>
-              <Typography.Text>{mood ? mood.relaxed.toFixed(4) : "-"}</Typography.Text>
-              <Typography.Text type="secondary">Aggressive</Typography.Text>
-              <Typography.Text>{mood ? mood.aggressive.toFixed(4) : "-"}</Typography.Text>
+              <Typography.Text type="secondary">Relaxed（原始）</Typography.Text>
+              <Typography.Text>{mood ? mood.rawRelaxed.toFixed(4) : "-"}</Typography.Text>
+              <Typography.Text type="secondary">Aggressive（原始）</Typography.Text>
+              <Typography.Text>{mood ? mood.rawAggressive.toFixed(4) : "-"}</Typography.Text>
             </div>
 
             {aiError && <Alert type="error" content={aiError} />}

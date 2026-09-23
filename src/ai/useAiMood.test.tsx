@@ -2,14 +2,14 @@
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AudioMoodService, AudioMoodStatus, MoodResult } from "../../packages/audio-ai/src";
-import { calibrateHappySad } from "./moodCalibration";
+import { calibrateHappySad, calibrateRelaxedAggressive, DEFAULT_VALENCE_SENSITIVITY } from "./moodCalibration";
 import { getActiveAiMood, resolveDominantMood, resolveMoodLabel, useAiMood } from "./useAiMood";
 
 const api = vi.hoisted(() => ({ createService: vi.fn(), invoke: vi.fn(), isTauri: vi.fn() }));
 vi.mock("../../packages/audio-ai/src", () => ({ createTauriAudioMoodService: api.createService }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: api.invoke, isTauri: api.isTauri }));
 
-const rawScores = { happy: 0.23, sad: 0.6, relaxed: 0.3, aggressive: 0.1 };
+const rawScores = { happy: 0.3, sad: 0.6, relaxed: 0.3, aggressive: 0.1 };
 const silence = { happy: 0, sad: 0, relaxed: 0, aggressive: 0 };
 const ready = (overrides: Partial<AudioMoodStatus> = {}): AudioMoodStatus => ({
   phase: "running", modelReady: true, backendConnected: true, lastError: null, ...overrides,
@@ -118,13 +118,15 @@ describe("AI mood calibration", () => {
     for (const sensitivity of [undefined, 4, 40]) {
       await advance(100);
       rerender({ sensitivity });
-      const calibrated = calibrateHappySad(happy, sad, sensitivity ?? 24);
+      const calibrated = calibrateHappySad(happy, sad, sensitivity ?? DEFAULT_VALENCE_SENSITIVITY);
+      const arousal = calibrateRelaxedAggressive(rawScores.relaxed, rawScores.aggressive);
       expect(result.current.mood).toMatchObject({
-        ...calibrated, relaxed: rawScores.relaxed, aggressive: rawScores.aggressive,
-        rawHappy: happy, rawSad: sad, silent: false, receivedAt,
+        ...calibrated, ...arousal,
+        rawHappy: happy, rawSad: sad, rawRelaxed: rawScores.relaxed, rawAggressive: rawScores.aggressive,
+        silent: false, receivedAt,
         streamEpoch: 7n, sequence: 1n, inferenceMs: 12, modelReady: true,
       });
-      const [highest, secondHighest] = [calibrated.happy, calibrated.sad, rawScores.relaxed, rawScores.aggressive]
+      const [highest, secondHighest] = [calibrated.happy, calibrated.sad, arousal.relaxed, arousal.aggressive]
         .sort((left, right) => right - left);
       expect(result.current.mood?.confidence).toBeCloseTo((highest - secondHighest) / highest);
       expect(getActiveAiMood(result.current.mood, result.current.status, performance.now())).toBe(result.current.mood);
@@ -139,7 +141,7 @@ describe("AI mood calibration", () => {
     const { result } = renderHook(() => useAiMood());
     emit(moodResult({ scores: { ...silence, [dimension]: 1 } }));
     expect(result.current.mood).toMatchObject({
-      ...calibrateHappySad(0, 0, 24), [dimension]: 1, rawHappy: 0, rawSad: 0, silent: false,
+      ...calibrateHappySad(0, 0, DEFAULT_VALENCE_SENSITIVITY), [dimension]: 1, rawHappy: 0, rawSad: 0, silent: false,
     });
     expect(result.current.dominantMood).toBe(dimension);
     expect(getActiveAiMood(result.current.mood, result.current.status, performance.now())).toBe(result.current.mood);

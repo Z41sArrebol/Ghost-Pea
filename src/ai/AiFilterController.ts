@@ -6,6 +6,28 @@ export type FilterMode = "default" | "ai";
 
 const KEYS = Object.keys(OUTPUT_LIMITS) as (keyof RenderParameters)[];
 const TRANSITION_SECONDS = 1.2;
+// 节拍驱动的参数（鼓点对比度、响度柔光、高频颗粒、低频暖光）多保留一些快层动态，
+// 情绪载体参数保持小比例，避免色温等被节拍抖动污染。
+const BASE_BLEND: Record<keyof RenderParameters, number> = {
+  contrast: 0.4,
+  brightness: 0.15,
+  temperature: 0.15,
+  shadowCool: 0.15,
+  highlightThr: 0.15,
+  vignette: 0.15,
+  grain: 0.4,
+  bloom: 0.4,
+  bloomWarm: 0.4,
+  lookDark: 0.15,
+  lookCalm: 0.15,
+  lookBright: 0.15,
+  lookHappy: 0.15,
+  lookSad: 0.15,
+  lookRelaxed: 0.15,
+  lookAggressive: 0.15,
+  saturation: 0.15,
+  gammaMid: 0.15,
+};
 const AI_RATES: Record<keyof RenderParameters, number> = {
   contrast: 0.12,
   brightness: 0.05,
@@ -19,6 +41,10 @@ const AI_RATES: Record<keyof RenderParameters, number> = {
   lookDark: 0.18,
   lookCalm: 0.18,
   lookBright: 0.18,
+  lookHappy: 0.18,
+  lookSad: 0.18,
+  lookRelaxed: 0.18,
+  lookAggressive: 0.18,
   saturation: 0.12,
   gammaMid: 0.06,
 };
@@ -37,12 +63,16 @@ function composeAiTarget(base: RenderParameters, params: ParamValues, mood: Mood
     lookDark: params.lookDark,
     lookCalm: params.lookCalm,
     lookBright: params.lookBright,
+    lookHappy: 0,
+    lookSad: 0,
+    lookRelaxed: 0,
+    lookAggressive: 0,
     saturation: 1,
     gammaMid: 1,
   };
   if (!mood || [mood.happy, mood.sad, mood.relaxed, mood.aggressive].every((score) => score === 0)) return target;
 
-  for (const key of KEYS) target[key] += (base[key] - target[key]) * 0.15;
+  for (const key of KEYS) target[key] += (base[key] - target[key]) * BASE_BLEND[key];
   const happy = Math.max(0, (mood.happy - 0.5) * 2);
   const sad = Math.max(0, (mood.sad - 0.5) * 2);
   const relaxed = Math.max(0, (mood.relaxed - 0.5) * 2);
@@ -62,15 +92,16 @@ function composeAiTarget(base: RenderParameters, params: ParamValues, mood: Mood
   target.saturation += amount * (0.25 * happy + 0.15 * aggressive - 0.3 * sad - 0.1 * relaxed);
   target.gammaMid += amount * (0.15 * happy + 0.1 * relaxed - 0.1 * sad - 0.05 * aggressive);
 
-  // Cap the visual mixing budget, rather than treating independent scores as probabilities.
+  // 每种情绪驱动自己的专属 LUT，用户的主题风格按剩余权重保留；总权重恒 ≤1。
   const budget = 0.6 * amount / Math.max(1, happy + sad + relaxed + aggressive);
-  const dark = (sad + aggressive * 0.8) * budget;
-  const calm = relaxed * budget;
-  const bright = happy * budget;
-  const retained = 1 - dark - calm - bright;
-  target.lookDark = target.lookDark * retained + dark;
-  target.lookCalm = target.lookCalm * retained + calm;
-  target.lookBright = target.lookBright * retained + bright;
+  const retained = 1 - (happy + sad + relaxed + aggressive) * budget;
+  target.lookDark *= retained;
+  target.lookCalm *= retained;
+  target.lookBright *= retained;
+  target.lookHappy = happy * budget;
+  target.lookSad = sad * budget;
+  target.lookRelaxed = relaxed * budget;
+  target.lookAggressive = aggressive * budget;
   return target;
 }
 
@@ -119,8 +150,8 @@ export class AiFilterController {
       const change = AI_RATES[key] * step;
       desired[key] = this.rendered[key] + Math.max(-change, Math.min(change, next - this.rendered[key]));
     }
-    // A shared interpolation factor keeps the three LUT weights inside their combined budget.
-    const lookKeys = ["lookDark", "lookCalm", "lookBright"] as const;
+    // A shared interpolation factor keeps the LUT weights inside their combined budget.
+    const lookKeys = ["lookDark", "lookCalm", "lookBright", "lookHappy", "lookSad", "lookRelaxed", "lookAggressive"] as const;
     let lookBlend = 1;
     for (const key of lookKeys) {
       const distance = Math.abs(target[key] - this.rendered[key]);
