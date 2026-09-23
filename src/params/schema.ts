@@ -45,7 +45,7 @@ export const PARAM_DEFS: ParamDef[] = [
   { kind: "slider", key: "mapCentroidTemp", label: "Centroid → 色温", group: "mapping", min: 0, max: 2, step: 0.01 },
   { kind: "slider", key: "mapOnsetLook", label: "鼓点 → LUT 调色", group: "mapping", min: 0, max: 0.08, step: 0.001 },
   { kind: "slider", key: "mapBassTint", label: "低频 → 中间调暖色", group: "mapping", min: 0, max: 0.25, step: 0.01 },
-  { kind: "slider", key: "mapBassZoom", label: "低频 → 镜头呼吸幅度", group: "mapping", min: 0, max: 0.005, step: 0.005 },
+  { kind: "slider", key: "mapBassZoom", label: "低频 → 镜头呼吸幅度", group: "mapping", min: 0, max: 0.5, step: 0.005 },
   { kind: "slider", key: "bassZoomAttack", label: "镜头呼吸上升时间", description: "低频增强后，镜头推近所需的时间；越短越跟手。", group: "orchestrator", min: 0.01, max: 0.2, step: 0.01, unit: "s" },
 
   { kind: "slider", key: "rmsAttack", label: "RMS Attack", description: "响度上升时的跟随速度；越短，光晕等响度效果响应越快。", group: "orchestrator", min: 0.01, max: 1, step: 0.01, unit: "s" },

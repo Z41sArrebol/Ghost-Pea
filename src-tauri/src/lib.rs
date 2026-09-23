@@ -59,6 +59,23 @@ async fn audio_performance_status(app: AppHandle) -> Result<DspPerformance, Stri
         .map_err(|error| format!("audio performance task failed: {error}"))?
 }
 
+/// 前端热更新麦克风混音设置（开关 / 手动底噪门限 / 增益 / 重新校准）。
+#[tauri::command]
+async fn set_microphone_settings(
+    app: AppHandle,
+    enabled: bool,
+    gate: f32,
+    gain: f32,
+    recalibrate: bool,
+) -> Result<AudioStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<AudioMonitor>()
+            .set_microphone_settings(enabled, gate, gain, recalibrate)
+    })
+    .await
+    .map_err(|error| format!("microphone settings task failed: {error}"))?
+}
+
 #[tauri::command]
 async fn start_ai_pcm_stream(
     app: AppHandle,
@@ -113,6 +130,7 @@ pub fn run() {
             stop_audio_monitor,
             audio_monitor_status,
             audio_performance_status,
+            set_microphone_settings,
             start_ai_pcm_stream,
             stop_ai_pcm_stream,
             ai_pcm_status

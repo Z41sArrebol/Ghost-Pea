@@ -21,7 +21,9 @@ const features = (sequence = 1): AudioFeatures => ({
 });
 const status = (overrides: Partial<AudioStatus> = {}): AudioStatus => ({
   ...features(), running: true, state: "running", lastError: null,
-  sampleRateHz: 48000, channels: 2, capturedFrames: 100, droppedSamples: 0, ...overrides,
+  sampleRateHz: 48000, channels: 2, capturedFrames: 100, droppedSamples: 0,
+  microphoneEnabled: true, microphoneLevel: 0.01, microphoneGate: 0.008, microphoneGain: 1,
+  ...overrides,
 });
 const stopped = () => status({ running: false, state: "stopped" });
 const commands = () => api.invoke.mock.calls.map(([command]) => command);

@@ -37,6 +37,10 @@ export interface AudioStatus {
   centroid: number;
   energyTrend: number;
   silence: boolean;
+  microphoneEnabled: boolean;
+  microphoneLevel: number;
+  microphoneGate: number;
+  microphoneGain: number;
 }
 
 export interface AudioFeatures {
@@ -99,6 +103,12 @@ export interface AiPcmStatus {
 | `centroid` | `number` | Spectral centroid 除以 Nyquist 后的归一化值，范围 `[0, 1]` |
 | `energyTrend` | `number` | 当前 RMS 相对上一窗口的变化方向和幅度，范围 `[-1, 1]` |
 | `silence` | `boolean` | RMS 是否低于当前固定阈值 `0.001` |
+| `microphoneEnabled` | `boolean` | 麦克风当前是否参与混音 |
+| `microphoneLevel` | `number` | 麦克风 2048 点窗口的线性 RMS，范围 `[0, 1]`；用于观察环境电平 |
+| `microphoneGate` | `number` | 当前生效的底噪门限；自动校准模式下为校准结果，手动模式下为设定值 |
+| `microphoneGain` | `number` | 当前平滑后的门限增益，`1` 表示全量通过，靠近 `0.15` 表示被压到最低增益 |
+
+系统音频与麦克风在 DSP 线程前合流，因此过滤后的缓冲会同时进入快速特征与 AI PCM 窗口。
 
 `bass + mid + treble` 在非静音窗口中约等于 `1`。这些值表示频谱构成，不表示三个频段各自的绝对音量；前端应结合 `rms` 使用。所有特征当前未经设备响度标定，进入滤镜前仍需 Attack/Release、限幅和静音回落。
 
@@ -284,6 +294,10 @@ console.log({
   centroid: 0,
   energyTrend: 0,
   silence: false,
+  microphoneEnabled: true,
+  microphoneLevel: 0,
+  microphoneGate: 0.008,
+  microphoneGain: 0,
 }
 ```
 
@@ -328,7 +342,59 @@ console.log("audio stopped", finalStatus);
 - 如果监听尚未运行，返回全零默认状态。
 - 再次调用 `start_audio_monitor` 会创建新的监听会话，累计计数从零开始。
 
-## 8. AI PCM Channel
+## 8. 麦克风底噪控制
+
+麦克风在 DSP 线程内与系统音频合流，前端无法在 JS 侧绕过门限，因此提供下列 Command 实时调整。参数在采集线程与 DSP 线程间通过原子量交换，下一个 DSP 窗口即可生效，无需重启监听。
+
+### Command
+
+```text
+set_microphone_settings
+```
+
+### 参数
+
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `enabled` | `boolean` | 是否让麦克风参与混音；`false` 时只保留系统音频 |
+| `gate` | `number` | 底噪门限，`0` 表示自动校准；有效范围 `[0, 0.2]`，超出会被后端截断 |
+| `gain` | `number` | 麦克风增益，范围 `[0, 1]` |
+| `recalibrate` | `boolean` | 置为 `true` 时重新开始约 2 秒的底噪校准（此期间请保持安静） |
+
+### 返回
+
+`Promise<AudioStatus>`
+
+### 示例
+
+```ts
+import { invoke } from "@tauri-apps/api/core";
+
+// 手动把门限抬到 0.03，常用做法是比环境电平高约 2 倍
+await invoke<AudioStatus>("set_microphone_settings", {
+  enabled: true,
+  gate: 0.03,
+  gain: 1,
+  recalibrate: false,
+});
+
+// 重新自动校准
+await invoke<AudioStatus>("set_microphone_settings", {
+  enabled: true,
+  gate: 0,
+  gain: 1,
+  recalibrate: true,
+});
+```
+
+行为说明：
+
+- 自动校准模式：启动后约 2 秒内保持最低增益 `0.15`，随后把该段环境 RMS 的 2.5 倍限制在 `[0.008, 0.2]` 作为门限。
+- 门限生效后，低于门限的声音不会静音，而是平滑压到最低增益，避免房间底噪、键盘声和远处环境音盖住音乐。
+- 设置值保存在应用进程内：停止后重新启动音频监听会沿用最近一次的门限与增益；应用重启后恢复为自动校准、增益 `1`。
+- 监听未运行时调用会返回全零默认状态，但设置值仍会被记住，下次启动生效。
+
+## 9. AI PCM Channel
 
 AI PCM 链路要求音频监听已经处于 `running`。它将合流后的单声道 PCM 重采样为 16 kHz，并发送固定 3 秒窗口；相邻窗口步长为 1 秒。
 
@@ -393,7 +459,7 @@ const status = await invoke<AiPcmStatus>("start_ai_pcm_stream", { channel });
 
 Tauri Channel 不提供模型消费确认。Channel 回调向 Web Worker 投递时，适配层必须采用单槽 latest-only 策略：模型忙时覆盖尚未开始推理的旧窗口，不建立无界队列。该 latest-only 行为由前端实现，Rust 端不会等待模型推理。Channel 发送失败时 AI PCM 自动禁用，错误写入 `lastError`；快速 DSP 和 WASAPI 监听继续运行。
 
-## 9. 推荐封装
+## 10. 推荐封装
 
 ```ts
 import { Channel, invoke } from "@tauri-apps/api/core";
@@ -403,6 +469,8 @@ export const audioMonitorApi = {
   status: () => invoke<AudioStatus>("audio_monitor_status"),
   performance: () => invoke<DspPerformance>("audio_performance_status"),
   stop: () => invoke<AudioStatus>("stop_audio_monitor"),
+  setMicrophone: (settings: { enabled: boolean; gate: number; gain: number; recalibrate?: boolean }) =>
+    invoke<AudioStatus>("set_microphone_settings", { recalibrate: false, ...settings }),
   startAiPcm: (channel: Channel<ArrayBuffer>) =>
     invoke<AiPcmStatus>("start_ai_pcm_stream", { channel }),
   stopAiPcm: () => invoke<AiPcmStatus>("stop_ai_pcm_stream"),
@@ -421,11 +489,12 @@ try {
 }
 ```
 
-## 10. 当前边界
+## 11. 当前边界
 
 当前版本仅提供：
 
 - 默认 Windows 播放设备的 WASAPI Loopback 与默认麦克风采集；麦克风失败时回退到仅播放音频。
+- 麦克风底噪门限与增益的运行时调整（含手动设置与重新自动校准）。
 - PCM 累计帧数和丢样统计。
 - RMS、Bass、Mid、Treble、Onset、Spectral Centroid、能量趋势和静音状态。
 - 最高 60 Hz 的 `audio-features` 主动事件。

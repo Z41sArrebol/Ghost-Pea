@@ -36,7 +36,7 @@ vi.mock("./audio/useAudioFeatures", () => ({
     featuresRef: audioFeaturesRef,
     lastReceivedAtRef: audioReceivedRef,
     running: state.running, source: "tauri", status: null, busy: false, error: null, stale: false,
-    start: vi.fn(), stop: vi.fn(),
+    start: vi.fn(), stop: vi.fn(), setMicrophoneSettings: vi.fn(),
   }),
 }));
 vi.mock("./useCamera", () => ({ useCamera: () => ({ cameras: [], error: null, busy: false, retry: vi.fn() }) }));
@@ -103,6 +103,19 @@ afterEach(() => {
 });
 
 describe("filter mode integration", () => {
+  it("enters live mode for OBS capture and exits with Escape", () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "直播模式" }));
+    expect(document.querySelector(".page")?.className).toContain("live");
+    expect(screen.getByText(/直播模式 · 按/)).toBeTruthy();
+    // F 只切换全屏，不退出直播模式
+    fireEvent.keyDown(window, { key: "f" });
+    expect(screen.getByRole("button", { name: /退出全屏/ })).toBeTruthy();
+    expect(document.querySelector(".page")?.className).toContain("live");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(document.querySelector(".page")?.className).not.toContain("live");
+  });
+
   it("keeps bass tint active while optional zoom follows only low-frequency rises", () => {
     state.mood = null;
     render(<App />);
@@ -142,8 +155,8 @@ describe("filter mode integration", () => {
     fireEvent.click(screen.getByText("映射"));
     frame(1);
     const before = { ...uniforms() };
-    fireEvent.keyDown(screen.getByRole("slider", { name: "鼓点 → LUT 调色" }), { key: "ArrowRight" });
-    fireEvent.keyDown(screen.getByRole("slider", { name: "低频 → 中间调暖色" }), { key: "ArrowRight" });
+    fireEvent.keyDown(screen.getByRole("slider", { name: "鼓点 → LUT 调色" }), { key: "ArrowRight", keyCode: 39 });
+    fireEvent.keyDown(screen.getByRole("slider", { name: "低频 → 中间调暖色" }), { key: "ArrowRight", keyCode: 39 });
     frame(1);
     expect(uniforms().uLookBeat).toBeGreaterThan(before.uLookBeat);
     expect(uniforms().uBassTint).toBeGreaterThan(before.uBassTint);
@@ -155,7 +168,7 @@ describe("filter mode integration", () => {
     const zoomBefore = uniforms().uZoom;
     fireEvent.click(screen.getByText("映射"));
     const zoomSlider = screen.getByRole("slider", { name: "低频 → 镜头呼吸幅度" });
-    fireEvent.keyDown(zoomSlider, { key: "ArrowLeft" });
+    fireEvent.keyDown(zoomSlider, { key: "ArrowLeft", keyCode: 37 });
     expect(Number(zoomSlider.getAttribute("aria-valuenow"))).toBeLessThan(0.4);
     frame(2);
     expect(uniforms().uZoom).toBeLessThan(zoomBefore);

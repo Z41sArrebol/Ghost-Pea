@@ -11,11 +11,12 @@ import {
   Select,
   Slider,
   Space,
+  Switch,
   Tabs,
   Tag,
   Typography,
 } from "@arco-design/web-react";
-import { IconMoon, IconSun } from "@arco-design/web-react/icon";
+import { IconFullscreen, IconFullscreenExit, IconLiveBroadcast, IconMoon, IconSun } from "@arco-design/web-react/icon";
 import { AiFilterController, type FilterMode } from "./ai/AiFilterController";
 import { DEFAULT_VALENCE_SENSITIVITY } from "./ai/moodCalibration";
 import { getActiveAiMood, useAiMood } from "./ai/useAiMood";
@@ -30,16 +31,44 @@ import { useCamera, type CameraConfig } from "./useCamera";
 
 const STATUS_UPDATE_MS = 250;
 
-type FunctionKey = "filter" | "mapping" | "orchestrator" | "camera" | "ai" | "presets";
+type FunctionKey = "filter" | "mapping" | "orchestrator" | "camera" | "audio" | "ai" | "presets";
 
 const TAB_ITEMS: { key: FunctionKey; label: string }[] = [
   { key: "filter", label: "滤镜" },
   { key: "mapping", label: "映射" },
   { key: "orchestrator", label: "编排" },
   { key: "camera", label: "相机" },
+  { key: "audio", label: "音频" },
   { key: "ai", label: "AI" },
   { key: "presets", label: "预设" },
 ];
+
+const LIVE_HINT_MS = 3500;
+
+// 直播模式全屏：优先走 Tauri 窗口 API，非 Tauri 环境（浏览器预览）回退到 Fullscreen API
+async function applyWindowFullscreen(next: boolean) {
+  const inTauri = typeof (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ !== "undefined";
+  if (inTauri) {
+    try {
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      await getCurrentWindow().setFullscreen(next);
+      return;
+    } catch {
+      // 权限未授予或调用失败：继续尝试浏览器全屏
+    }
+  }
+  try {
+    if (next) {
+      if (!document.fullscreenElement && typeof document.documentElement.requestFullscreen === "function") {
+        await document.documentElement.requestFullscreen();
+      }
+    } else if (document.fullscreenElement) {
+      await document.exitFullscreen();
+    }
+  } catch {
+    // 全屏被拒绝（缺少用户手势等）时忽略：直播布局依然生效
+  }
+}
 
 function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; onToggleTheme: () => void }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -57,8 +86,19 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
   const [frameStats, setFrameStats] = useState({ render: 0, video: 0, p95: 0 });
   const [meter, setMeter] = useState({ rms: 0, bass: 0, treble: 0, onset: 0, centroid: 0.5 });
   const [valenceSensitivity, setValenceSensitivity] = useState(DEFAULT_VALENCE_SENSITIVITY);
+  const [liveMode, setLiveMode] = useState(false);
+  const [liveHintVisible, setLiveHintVisible] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const liveHintTimer = useRef<number | null>(null);
+  const liveHintVisibleRef = useRef(false);
+  liveHintVisibleRef.current = liveHintVisible;
+  const isFullscreenRef = useRef(false);
+  isFullscreenRef.current = isFullscreen;
+  const [micSettings, setMicSettings] = useState({ enabled: true, gate: 0, gain: 1 });
+  const micSettingsRef = useRef(micSettings);
+  micSettingsRef.current = micSettings;
 
-  const { featuresRef, lastReceivedAtRef, running, source, status, busy: audioBusy, error: audioError, stale: audioStale, start, stop } = useAudioFeatures();
+  const { featuresRef, lastReceivedAtRef, running, source, status, busy: audioBusy, error: audioError, stale: audioStale, start, stop, setMicrophoneSettings } = useAudioFeatures();
   const {
     mood,
     moodLabel,
@@ -86,6 +126,81 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
 
   const setParam = useCallback((key: string, value: number) => {
     setParams((prev) => ({ ...prev, [key]: value }));
+  }, []);
+
+  // 直播模式只负责隐藏界面（窗口尺寸不变，方便同机操作 OBS）；退出时一并退出全屏
+  const setLive = useCallback((next: boolean) => {
+    setLiveMode(next);
+    if (!next) {
+      setIsFullscreen(false);
+      void applyWindowFullscreen(false);
+    }
+  }, []);
+
+  const showLiveHint = useCallback(() => {
+    setLiveHintVisible(true);
+    if (liveHintTimer.current !== null) window.clearTimeout(liveHintTimer.current);
+    liveHintTimer.current = window.setTimeout(() => setLiveHintVisible(false), LIVE_HINT_MS);
+  }, []);
+
+  const toggleFullscreen = useCallback(() => {
+    const next = !isFullscreenRef.current;
+    setIsFullscreen(next);
+    void applyWindowFullscreen(next);
+    showLiveHint();
+  }, [showLiveHint]);
+
+  const updateMicSettings = useCallback((patch: Partial<{ enabled: boolean; gate: number; gain: number }>) => {
+    const next = { ...micSettingsRef.current, ...patch };
+    micSettingsRef.current = next;
+    setMicSettings(next);
+    void setMicrophoneSettings(next);
+  }, [setMicrophoneSettings]);
+
+  const recalibrateMicrophone = useCallback(() => {
+    // 重新校准意味着回到自动门限，否则手动门限会继续生效、按钮看起来没反应。
+    const next = { ...micSettingsRef.current, gate: 0 };
+    micSettingsRef.current = next;
+    setMicSettings(next);
+    void setMicrophoneSettings({ ...next, recalibrate: true });
+  }, [setMicrophoneSettings]);
+
+  // 直播模式：Esc 退出；F 切换全屏；鼠标滑动时短暂呼出提示
+  useEffect(() => {
+    if (!liveMode) return;
+    showLiveHint();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setLive(false);
+        return;
+      }
+      const target = event.target as HTMLElement | null;
+      const typing = !!target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
+      if (!typing && !event.ctrlKey && !event.altKey && !event.metaKey && event.key.toLowerCase() === "f") {
+        event.preventDefault();
+        toggleFullscreen();
+      }
+    };
+    const onMouseMove = () => {
+      if (!liveHintVisibleRef.current) showLiveHint();
+    };
+    const onFullscreenChange = () => {
+      // 用户用 F11 / 系统方式切换全屏时同步按钮状态（不据此退出直播模式）
+      setIsFullscreen(Boolean(document.fullscreenElement));
+    };
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("mousemove", onMouseMove);
+    document.addEventListener("fullscreenchange", onFullscreenChange);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("mousemove", onMouseMove);
+      document.removeEventListener("fullscreenchange", onFullscreenChange);
+    };
+  }, [liveMode, setLive, showLiveHint, toggleFullscreen]);
+
+  useEffect(() => () => {
+    if (liveHintTimer.current !== null) window.clearTimeout(liveHintTimer.current);
   }, []);
 
   useEffect(() => {
@@ -247,6 +362,15 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
     });
   }, []);
 
+  // 麦克风实时读数（后端未运行时显示占位符）
+  const microphoneLevelText = status ? (status.microphoneLevel ?? 0).toFixed(4) : "-";
+  const microphoneGateText = status ? (status.microphoneGate ?? 0).toFixed(4) : "-";
+  const microphoneStateText = !micSettings.enabled
+    ? "已静音"
+    : !status?.running
+      ? "未运行"
+      : (status.microphoneGain ?? 0) > 0.16 ? "打开" : "压住";
+
   const panelContent = () => {
     switch (activeFn) {
       case "filter":
@@ -284,6 +408,71 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
             </div>
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>
               修改后相机会重启视频流。
+            </Typography.Text>
+          </Space>
+        );
+      case "audio":
+        return (
+          <Space direction="vertical" size="medium" style={{ width: "100%" }}>
+            <div className="param-head">
+              <Typography.Text>麦克风参与混音</Typography.Text>
+              <Switch
+                aria-label="麦克风参与混音"
+                checked={micSettings.enabled}
+                onChange={(checked) => updateMicSettings({ enabled: checked })}
+              />
+            </div>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              关闭后麦克风完全不进入混音，只保留系统音频
+            </Typography.Text>
+            <div>
+              <div className="param-head">
+                <Typography.Text>底噪门限</Typography.Text>
+                <Typography.Text type="secondary">
+                  {micSettings.gate > 0 ? micSettings.gate.toFixed(3) : "自动校准"}
+                </Typography.Text>
+              </div>
+              <Slider
+                min={0}
+                max={0.2}
+                step={0.002}
+                value={micSettings.gate}
+                onChange={(value) => updateMicSettings({ gate: Array.isArray(value) ? value[0] : value })}
+              />
+            </div>
+            <div>
+              <div className="param-head">
+                <Typography.Text>麦克风增益</Typography.Text>
+                <Typography.Text type="secondary">{micSettings.gain.toFixed(2)}</Typography.Text>
+              </div>
+              <Slider
+                min={0}
+                max={1}
+                step={0.05}
+                value={micSettings.gain}
+                onChange={(value) => updateMicSettings({ gain: Array.isArray(value) ? value[0] : value })}
+              />
+            </div>
+            <Button long onClick={recalibrateMicrophone}>
+              重新自动校准底噪
+            </Button>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "minmax(96px, auto) minmax(0, 1fr)",
+                gap: "8px 16px",
+                fontVariantNumeric: "tabular-nums",
+              }}
+            >
+              <Typography.Text type="secondary">环境电平</Typography.Text>
+              <Typography.Text>{microphoneLevelText}</Typography.Text>
+              <Typography.Text type="secondary">当前门限</Typography.Text>
+              <Typography.Text>{microphoneGateText}</Typography.Text>
+              <Typography.Text type="secondary">门限状态</Typography.Text>
+              <Typography.Text>{microphoneStateText}</Typography.Text>
+            </div>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              自动校准以启动后约 2 秒的环境音为基准；低于门限的声音只按最低增益混入，避免底噪盖住音乐。改成手动门限后立即生效，不需要重启音频。
             </Typography.Text>
           </Space>
         );
@@ -412,7 +601,7 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
   };
 
   return (
-    <div className="page">
+    <div className={`page${liveMode ? " live" : ""}`}>
       <div className="stage">
         <video ref={videoRef} className="hidden-video" playsInline muted />
         <canvas ref={canvasRef} className={`preview${fitMode === "cover" ? " fit-cover" : ""}`} />
@@ -455,6 +644,9 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
               setPreviewAttempt((value) => value + 1);
             }}>重试预览</Button>
           )}
+          <Button size="small" icon={<IconLiveBroadcast />} onClick={() => setLive(true)}>
+            直播模式
+          </Button>
         </div>
 
         <div className="stage-stats">
@@ -486,6 +678,25 @@ function DemoPage({ themeMode, onToggleTheme }: { themeMode: "dark" | "light"; o
             className="stage-alert"
             content={[glError, cameraError, audioError, glWarning].filter(Boolean).join("；")}
           />
+        )}
+
+        {liveMode && (
+          <div className={`live-hint${liveHintVisible ? " visible" : ""}`}>
+            <IconLiveBroadcast aria-hidden="true" />
+            <span>
+              直播模式 · 按 <kbd>Esc</kbd> 退出
+            </span>
+            <Button
+              size="mini"
+              icon={isFullscreen ? <IconFullscreenExit /> : <IconFullscreen />}
+              onClick={toggleFullscreen}
+            >
+              {isFullscreen ? "退出全屏 (F)" : "全屏 (F)"}
+            </Button>
+            <Button size="mini" type="primary" onClick={() => setLive(false)}>
+              退出
+            </Button>
+          </div>
         )}
       </div>
 
