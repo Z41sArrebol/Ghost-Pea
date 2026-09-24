@@ -73,11 +73,3 @@ pitch/          路演与提案材料
 - [音频监听接口](docs/audio-monitor-api.md)
 - [audio-ai 包架构](docs/audio-ai-package-architecture.md)
 
-## 团队
-
-| 成员 | 负责 |
-|---|---|
-| 李佳玥 | Rust 音频后端：WASAPI 采集、快速 DSP、重采样、Tauri 事件/通道 |
-| 张智瑞 | 前端渲染与 UI：滤镜链、视觉主题、参数编排器、Live/Memory Mode、OBS 联调 |
-
-> 影石「白日方舟」黑客松赛道一作品（2026.09，南京），组队提案书见 [pitch/](pitch/Ghost-Pea-共振镜头-组队提案书.md)。
